@@ -1,0 +1,46 @@
+# Python caches and local tooling state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Training/evaluation outputs and model weights
+artifacts/
+checkpoints/
+logs/
+reports/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# Generated datasets and serialized caches
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.parquet
+*.arrow
+*.bin
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Third-party trees are ignored by default. The source-only DrivoR files
+# required by this project are force-added in the initial repository import.
+vendor/

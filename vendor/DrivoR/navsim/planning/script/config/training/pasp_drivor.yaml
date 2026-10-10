@@ -1,0 +1,24 @@
+defaults:
+  - default_training
+  - _self_
+
+experiment_name: pasp_drivor_50ep
+trainer:
+  params:
+    max_epochs: 50
+    strategy: ddp
+    accelerator: gpu
+    devices: 8
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
+    log_every_n_steps: 1
+    enable_progress_bar: false
+dataloader:
+  params:
+    # Per-GPU batch. With trainer.devices=8 this is an effective batch of 192.
+    batch_size: 24
+    num_workers: 8
+agent:
+  num_gpus: 8
+  config:
+    preference_negative_bank: ${oc.env:PASP_NEGATIVE_BANK,""}
