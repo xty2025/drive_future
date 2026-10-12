@@ -7,13 +7,18 @@
 # perception/eta) and the FULL all-native Scene K/V (5x201+2 = 1007 tokens,
 # every DINOv3 token retained instead of the compressed 66).
 #
-# Protocol (user: "先分阶段再做score的训练，最后联合进行微调"):
+# Protocol (user: 表征~20ep 就够, scorer 要多训 -> 先单独训 50ep score,
+#           再打开感知梯度让 score 回传感知联合微调):
 #   STAGE 1 (staged)  run_navtrain_wan_e2e_twophase_ddp.py
-#                     Phase A: trajectory generator (eta+theta), phi frozen.
-#                     Phase B: scorer-only (psi) on a frozen per-scene cache.
+#                     Phase A: representation / trajectory generator (eta+theta),
+#                              phi frozen  -- ~20 epochs (NVS_PHASE_A_EPOCHS).
+#                     Phase B: scorer-ONLY (psi) on a frozen per-scene cache;
+#                              perception frozen == "单独训 score" -- 50 epochs
+#                              (NVS_PHASE_B_EPOCHS).  scorer gets the most training.
 #   STAGE 2 (joint)   run_navtrain_wan_e2e_ddp.py --resume <stage1>/checkpoint.pt
-#                     eta+theta+psi trained TOGETHER; the un-detached score loss
-#                     backprops into perception.  This is the "联合微调".
+#                     perception gradient OPEN (un-detached scene K/V): eta+theta+psi
+#                     trained TOGETHER so the score loss backprops into perception
+#                     -- the "联合微调", 50 epochs (NVS_JOINT_EPOCHS).
 #
 # Topology : 1 node x 16 GPU, per-GPU batch 12 => global batch 192.
 #            All-native (1007-token scene self-attention) is ~heavier than the
@@ -75,7 +80,7 @@ unset MASTER_ADDR MASTER_PORT WORLD_SIZE RANK LOCAL_RANK
 
 NPROC="${NVS_NPROC_PER_NODE:-16}"
 BATCH="${NVS_BATCH:-12}"
-EPOCHS_A="${NVS_PHASE_A_EPOCHS:-50}"
+EPOCHS_A="${NVS_PHASE_A_EPOCHS:-20}"
 EPOCHS_B="${NVS_PHASE_B_EPOCHS:-50}"
 EPOCHS_JOINT="${NVS_JOINT_EPOCHS:-50}"
 mkdir -p "$STAGED_DIR" "$JOINT_DIR"
@@ -84,6 +89,7 @@ LOG_A="${STAGED_DIR}/train_staged_${TS}.log"
 LOG_J="${JOINT_DIR}/train_joint_${TS}.log"
 
 echo "[LAUNCH] e2e ALL-NATIVE protocol | Wan ActionDiT | nproc=${NPROC} | batch/GPU=${BATCH} | global_batch=$((BATCH * NPROC))"
+echo "[LAUNCH] epochs: PhaseA(repr)=${EPOCHS_A} -> PhaseB(score-only)=${EPOCHS_B} -> Joint(perception-grad-open)=${EPOCHS_JOINT}"
 echo "[LAUNCH] stage1(staged A+B)=${STAGED_DIR}  log=${LOG_A}"
 echo "[LAUNCH] stage2(joint finetune)=${JOINT_DIR}  log=${LOG_J}"
 echo "[LAUNCH] python=$("$PYBIN" -c "import sys,timm; print(sys.executable, timm.__version__)")"
