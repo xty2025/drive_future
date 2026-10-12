@@ -335,6 +335,9 @@ def main() -> int:
     per_scene: list[dict] = []
     bev_done = 0
     oracle_failures = 0
+    ns_mean_sum = 0.0
+    ns_cand0_sum = 0.0
+    ns_count = 0
     batch_i = 0
     run_start = time.time()
 
@@ -383,6 +386,11 @@ def main() -> int:
                     "oracle_best_pdms": round(float(fs_np[row].max()), 4),
                     "oracle_match": bool(sel_idx == oracle_idx),
                 })
+                fin = fs_np[row][np.isfinite(fs_np[row])]
+                if fin.size:
+                    ns_mean_sum += float(fin.mean())
+                    ns_cand0_sum += float(fs_np[row, 0]) if np.isfinite(fs_np[row, 0]) else 0.0
+                    ns_count += 1
             per_scene.append(rec)
 
             if (bev_done < args.bev_scenes and fs_np is not None
@@ -423,6 +431,8 @@ def main() -> int:
         "oracle_best_pdms": round(float(acc[1].item()) / denom_scene, 4),
         "oracle_match_rate": round(float(acc[2].item()) / denom_scene, 4),
         "matched_gt_ade_m": round(float(acc[3].item()) / denom_ade, 4),
+        "noscorer_mean64_pdms": round(ns_mean_sum / max(ns_count, 1), 4),
+        "noscorer_cand0_pdms": round(ns_cand0_sum / max(ns_count, 1), 4),
         "oracle_failures": oracle_failures,
         "bev_rendered": bev_done,
         "elapsed_s": round(time.time() - run_start, 1),

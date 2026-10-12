@@ -79,6 +79,7 @@ class TimmDinoV3Student(nn.Module):
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
         max_output_tokens: int = 32,
+        use_all_native_tokens: bool = False,
     ) -> None:
         super().__init__()
         try:
@@ -116,9 +117,17 @@ class TimmDinoV3Student(nn.Module):
         # keeps DINOv3's native CLS/register tokens too, so only the remaining
         # output slots are injected as queries.  Image patches stay in every
         # block's Q/K/V and are summarized into these tokens.
-        self.scene_queries = nn.Parameter(
+        scene_query_init = (
             torch.randn(max_output_tokens - self.num_prefix_tokens, self.backbone_dim) * 1e-6
         )
+        if use_all_native_tokens:
+            # All-native mode emits every DINOv3 token and never injects scene
+            # queries.  Keep the tensor as a non-trainable buffer so it stays out
+            # of parameters()/the optimizer and DDP does not expect a gradient
+            # for it (which would otherwise force find_unused_parameters=True).
+            self.register_buffer("scene_queries", scene_query_init, persistent=False)
+        else:
+            self.scene_queries = nn.Parameter(scene_query_init)
         self.output_projection = nn.Linear(self.backbone_dim, output_dim)
         self.output_projection._v6_role = "eta"  # type: ignore[attr-defined]
         self.train(True)
@@ -210,18 +219,44 @@ class TimmDinoV3Student(nn.Module):
         )
         return cls, registers, scene_queries
 
-    def forward(self, images: torch.Tensor, output_tokens: int) -> torch.Tensor:
+    def _forward_all_native(self, images: torch.Tensor) -> torch.Tensor:
+        """Run backbone without query injection; return all native tokens (CLS+reg+patches)."""
+        backbone = self.backbone
+        tokens = backbone.patch_embed(images)
+        positional = backbone._pos_embed(tokens)
+        if isinstance(positional, tuple):
+            tokens, rope = positional
+        else:
+            tokens, rope = positional, None
+        tokens = backbone.norm_pre(tokens)
+        if getattr(backbone, "rope_mixed", False) and rope is not None:
+            for index, block in enumerate(backbone.blocks):
+                tokens = block(tokens, rope=rope[index])
+        else:
+            for block in backbone.blocks:
+                try:
+                    tokens = block(tokens, rope=rope)
+                except TypeError:
+                    tokens = block(tokens)
+        tokens = backbone.norm(tokens)
+        split_dinov3_tokens(tokens, self.num_prefix_tokens)
+        return tokens
+
+    def forward(self, images: torch.Tensor, output_tokens: int | None = None) -> torch.Tensor:
         b, t, v, c, _, _ = images.shape
         flat = images.reshape(b * t * v, c, images.shape[-2], images.shape[-1])
         flat = torch.nn.functional.interpolate(flat, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
         flat = flat.permute(0, 2, 3, 1)
         flat = (flat - self.mean) / self.std
         flat = flat.permute(0, 3, 1, 2).contiguous()
-        layout = self.token_layout(output_tokens)
-        cls_token, register_tokens, scene_queries = self._forward_features_with_scene_queries(
-            flat, layout["scene_queries"]
-        )
-        tokens = torch.cat((cls_token, register_tokens, scene_queries), dim=1)
+        if output_tokens is None:
+            tokens = self._forward_all_native(flat)
+        else:
+            layout = self.token_layout(output_tokens)
+            cls_token, register_tokens, scene_queries = self._forward_features_with_scene_queries(
+                flat, layout["scene_queries"]
+            )
+            tokens = torch.cat((cls_token, register_tokens, scene_queries), dim=1)
         tokens = self.output_projection(tokens)
         tokens = tokens.reshape(b, t, v, tokens.shape[1], -1)
         return tokens.mean(dim=2)
@@ -240,10 +275,12 @@ class SceneEncoder(nn.Module):
         dino_lora_rank: int = 16,
         dino_lora_alpha: float = 16.0,
         dino_lora_dropout: float = 0.0,
+        use_all_native_tokens: bool = False,
     ) -> None:
         super().__init__()
         self.current_tokens = current_tokens
         self.history_tokens = history_tokens
+        self.use_all_native_tokens = use_all_native_tokens
         self.student = (
             TimmDinoV3Student(
                 checkpoint=dino_checkpoint,
@@ -253,10 +290,13 @@ class SceneEncoder(nn.Module):
                 lora_rank=dino_lora_rank,
                 lora_alpha=dino_lora_alpha,
                 lora_dropout=dino_lora_dropout,
+                use_all_native_tokens=use_all_native_tokens,
             )
             if dino_checkpoint
             else SpatialStudent(d_model)
         )
+        if use_all_native_tokens and not isinstance(self.student, TimmDinoV3Student):
+            raise ValueError("use_all_native_tokens requires a real DINOv3 checkpoint")
         self.time_embedding = nn.Parameter(torch.zeros(5, d_model))
         self.ego_mlp = nn.Sequential(nn.Linear(ego_dim + 4, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         self.ego_query = nn.Parameter(torch.randn(2, d_model) * 0.02)
@@ -279,11 +319,16 @@ class SceneEncoder(nn.Module):
         clean_ego: torch.Tensor | None = None,
     ) -> torch.Tensor:
         observation.validate()
-        visual_current = self.student(observation.rgb_history[:, -1:], self.current_tokens)[:, 0]
-        visual_history = self.student(observation.rgb_history[:, :-1], self.history_tokens)
-        visual_history = visual_history + self.time_embedding[:-1].view(1, 4, 1, -1)
-        visual_current = visual_current + self.time_embedding[-1].view(1, 1, -1)
-        visual = torch.cat((visual_current, visual_history.flatten(1, 2)), dim=1)
+        if self.use_all_native_tokens:
+            all_frames = self.student(observation.rgb_history)
+            all_frames = all_frames + self.time_embedding.view(1, 5, 1, -1)
+            visual = all_frames.flatten(1, 2)
+        else:
+            visual_current = self.student(observation.rgb_history[:, -1:], self.current_tokens)[:, 0]
+            visual_history = self.student(observation.rgb_history[:, :-1], self.history_tokens)
+            visual_history = visual_history + self.time_embedding[:-1].view(1, 4, 1, -1)
+            visual_current = visual_current + self.time_embedding[-1].view(1, 1, -1)
+            visual = torch.cat((visual_current, visual_history.flatten(1, 2)), dim=1)
         if clean_ego is None:
             clean_ego = self.encode_clean_ego(observation)
         if clean_ego.ndim != 2 or clean_ego.shape != (visual.shape[0], visual.shape[-1]):
@@ -373,6 +418,7 @@ class DirectedPairDiT(nn.Module):
         dino_lora_alpha: float = 16.0,
         dino_lora_dropout: float = 0.0,
         ego_dim: int = 8,
+        use_all_native_tokens: bool = False,
     ) -> None:
         super().__init__()
         if d_model % heads:
@@ -381,6 +427,9 @@ class DirectedPairDiT(nn.Module):
         self.action_tokens = action_tokens
         self.register_tokens = register_tokens
         self.xy_scale = xy_scale
+        self.use_all_native_tokens = use_all_native_tokens
+        if use_all_native_tokens:
+            scene_tokens = 5 * 201 + 2
         self.scene_tokens = scene_tokens
         self.eta = SceneEncoder(
             d_model,
@@ -391,6 +440,7 @@ class DirectedPairDiT(nn.Module):
             dino_lora_rank=dino_lora_rank,
             dino_lora_alpha=dino_lora_alpha,
             dino_lora_dropout=dino_lora_dropout,
+            use_all_native_tokens=use_all_native_tokens,
         )
         self.phi = nn.ModuleDict(
             {

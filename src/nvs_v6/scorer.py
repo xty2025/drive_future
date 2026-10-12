@@ -69,10 +69,16 @@ class ScratchDrivoRScorer(nn.Module):
         heads: int = 1,
         ffn_dim: int = 1024,
         decoder_layers: int = 4,
+        scene_tokens: int = 66,
         future_layers: int | None = None,
     ) -> None:
         super().__init__()
         del future_layers  # compatibility only; Future Register is not consumed
+        # Expected NVS Scene K/V length.  66 is the compressed-query layout;
+        # 1007 is the all-native layout (5x201 DINOv3 tokens + 2 ego-fused).
+        # The scorer is length-agnostic except that the final two tokens are
+        # the ego-fused pair pooled into ``ego_token``.
+        self.scene_tokens = scene_tokens
         try:
             from navsim.agents.drivoR.layers.losses.drivor_loss import DrivoRLoss
             from navsim.agents.drivoR.score_module.scorer import Scorer
@@ -120,12 +126,14 @@ class ScratchDrivoRScorer(nn.Module):
         if trajectory.ndim != 4 or trajectory.shape[-2:] != (8, 3):
             raise ValueError("DrivoR scorer expects trajectory [B,M,8,3]")
         if scene.ndim != 3:
-            raise ValueError("NVS scene_context must be [B,66,D]")
+            raise ValueError("NVS scene_context must be [B,S,D]")
         batch, candidates = trajectory.shape[:2]
         if scene.shape[0] != batch:
             raise ValueError("scene_context and trajectory batch axes must align")
-        if scene.shape[1] != 66:
-            raise ValueError(f"scratch scorer requires NVS Scene [B,66,D], got {tuple(scene.shape)}")
+        if scene.shape[1] != self.scene_tokens:
+            raise ValueError(
+                f"scratch scorer requires NVS Scene [B,{self.scene_tokens},D], got {tuple(scene.shape)}"
+            )
         if scene.shape[-1] != self.config.tf_d_model:
             raise ValueError("scene_context width must equal scorer d_model")
         # The score objective is psi-only.  Keep detachment unconditional even
