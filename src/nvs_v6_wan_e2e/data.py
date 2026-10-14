@@ -1,4 +1,4 @@
-"""v6 observation/target boundaries and Multi-GT manifest helpers."""
+"""v6 observation/target boundaries and the Multi-GT ``.npz`` loader."""
 
 from __future__ import annotations
 

@@ -155,11 +155,15 @@ model:
     skip_prefixes: [action_encoder., head., mode_projection., ego_to_action_projection., time_queries]
     loaded_keys: 226
     load_strictness: strict_true_full_state_dict
+  # theta is a rectified-flow denoiser: the anchor grid is the sigma=1 prior, each
+  # candidate's matched GT is the sigma=0 data endpoint, and Stage 2 draws one
+  # random t per scene per forward.  The deployed path is still ONE forward at
+  # sigma=1, so the inverse x0 = x_sigma - sigma*v returns a metric trajectory
+  # with no rollout and the anchors' oracle-best PDMS is preserved at init.
   action_sampling_loops: 0
-  random_flow_time_training: false
-  # The shared v6 spec withdrew the trajectory->Register path (its "attack 5"), and
-  # that withdrawal still binds nvs_v6/nvs_v6_wan through config_v6_final.yaml.  This
-  # e2e contract deliberately reverses it for this package only: Stage 1 is a
+  random_flow_time_training: true
+  # The shared v6 spec withdrew the trajectory->Register path (its "attack 5").  This
+  # e2e contract deliberately reverses it for this package: Stage 1 is a
   # trajectory-conditioned future representation, and a Register that cannot see the
   # trajectory can only ever predict one scene's average future.  Measured on 16 real
   # scenes, two GTs' compressed targets sit 0.205 apart against 0.542 across scenes,

@@ -1,21 +1,21 @@
-"""navtest PDMS (OFFICIAL navsim path) for the all-native-token e2e lineage.
+"""navtest PDMS scored the OFFICIAL navsim way, for the joint e2e lineage.
 
-``eval_navtest_official_pdms.py`` scores the ``nvs_v6_wan`` (joint) lineage; its
-checkpoint has 851 model tensors and no ``use_all_native_tokens`` flag, so it
-cannot ``strict=True``-load an ``nvs_v6_wan_e2e`` checkpoint (850 tensors,
-1007-token scene context).  This script is that same evaluation with the e2e
-model/scorer construction of ``eval_navtrain_wan_e2e_pdms_bev.py``:
+This is the held-out counterpart of ``eval_navtrain_wan_e2e_pdms_bev.py``: it
+reuses that script's model/scorer construction and candidate generation, but the
+candidates are scored by ``official_navtest_oracle.OfficialNavsimOracle`` --
+official ``MetricCache`` + official ``PDMScorer`` + ``pdm_score`` aggregation --
+rather than DrivoR's ``get_sub_score`` on the float32-quantized train cache.
 
   * identical navtest scene index (same DrivoR navtest cache + same log root +
     the same sidecar in ``--index-dir``), so the scene set is bit-identical to
     the baseline run and the numbers are directly comparable;
-  * identical candidate generation and scorer selection;
-  * candidates scored by ``official_navtest_oracle.OfficialNavsimOracle`` --
-    official ``MetricCache`` + official ``PDMScorer`` + ``pdm_score``
-    aggregation -- NOT DrivoR ``get_sub_score``.
+  * candidates from ``JointStage2Module.inference``: the deployed single forward,
+    the 64-anchor prior denoised once at ``sigma = 1`` and inverted algebraically
+    to a metric trajectory.  No rollout, so what is scored is what ships;
+  * identical scorer selection (``scorer.select``).
 
-Per-scene records carry the six keys ``merge_navtest_shards.py`` recomputes its
-summary from, so sharding and reporting reuse the existing tooling unchanged.
+Per-scene records carry the keys ``merge_navtest_shards.py`` recomputes its summary
+from, so sharding and reporting reuse the existing tooling unchanged.
 Read-only w.r.t. every package file, trainer script and checkpoint.
 """
 from __future__ import annotations
@@ -60,10 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--depth", type=int, default=0, help="0 = read depth from the checkpoint config")
+    parser.add_argument("--heads", type=int, default=0,
+                        help="0 = read from the checkpoint config (the Wan payload fixes num_heads=4 at hidden_dim=256)")
+    parser.add_argument("--target-dim", type=int, default=0, help="0 = read from the checkpoint config")
+    parser.add_argument("--wan-backbone", default=trainer.DEFAULT_WAN_BACKBONE,
+                        help="only needed to build theta before the checkpoint overwrites it")
+    parser.add_argument("--grad-checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--dino-checkpoint", default="")
-    parser.add_argument("--use-all-native-tokens", action="store_true",
-                        help="force the 1007-token scene layout (default: read from the checkpoint config)")
     parser.add_argument("--drivor-cache", default=e2e.NAVTEST_CACHE,
                         help="navtest DrivoR cache; used ONLY to resolve the scene index, never for scoring")
     parser.add_argument("--official-cache", default=OFFICIAL_NAVTEST_CACHE)
@@ -99,33 +103,18 @@ def main() -> int:
     Path(args.index_dir).mkdir(parents=True, exist_ok=True)
     result_path = output_dir / ("result.json" if args.shard_count == 1 else f"result.shard{args.shard_index}.json")
 
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
-    depth = args.depth or int(config.get("depth", 8))
-    dino = args.dino_checkpoint or config.get("dino_checkpoint", trainer.DEFAULT_DINO)
-    opt_step = int(ckpt.get("opt_step", -1))
-    epoch = int(ckpt.get("epoch", -1))
-    use_all_native = bool(config.get("use_all_native_tokens", False)) or args.use_all_native_tokens
-
-    model = trainer.DirectedPairDiT(
-        d_model=256, heads=8, ffn_dim=1024, depth=depth,
-        dino_checkpoint=dino, dino_model_name="vit_large_patch16_dinov3.lvd1689m",
-        dino_lora_rank=16, dino_lora_alpha=16.0,
-        use_all_native_tokens=use_all_native,
+    net, model, scorer, meta = trainer.load_joint_checkpoint(
+        args.checkpoint,
+        device=device,
+        depth=args.depth,
+        heads=args.heads,
+        target_dim=args.target_dim,
+        dino_checkpoint=args.dino_checkpoint,
+        wan_backbone=args.wan_backbone,
+        grad_checkpointing=args.grad_checkpointing,
     )
-    model.load_state_dict(ckpt["model"], strict=True)
-    scorer = trainer.ScratchDrivoRScorer(
-        d_model=256, heads=1, ffn_dim=1024, decoder_layers=4, scene_tokens=model.scene_tokens
-    )
-    scorer.load_state_dict(ckpt["scorer"], strict=True)
-    model.to(device).eval()
-    scorer.to(device).eval()
-    net = trainer.JointStage2Module(model, scorer).to(device).eval()
-    print(json.dumps({"event": "ckpt_loaded", "checkpoint": str(args.checkpoint),
-                      "opt_step": opt_step, "epoch": epoch, "depth": depth,
-                      "use_all_native_tokens": use_all_native,
-                      "scene_tokens": int(model.scene_tokens),
-                      "model_tensors": len(ckpt["model"]), "scorer_tensors": len(ckpt["scorer"])}), flush=True)
+    opt_step, epoch = meta["opt_step"], meta["epoch"]
+    print(json.dumps({"event": "ckpt_loaded", **meta}), flush=True)
 
     index_start = time.time()
     candidates = e2e.build_navtest_index(args.drivor_cache, args.log_root, Path(args.index_dir), args.max_scenes)
@@ -183,7 +172,7 @@ def main() -> int:
         mode_codes = modes.expand_for_batch(size, device)
         source = initializer.clean(observation.ego_history, mode_codes)
         with torch.no_grad():
-            endpoint, trajectory, logits = net(observation, source, mode_codes)
+            endpoint, trajectory, logits = net.inference(observation, source, mode_codes)
             del endpoint
             try:
                 labels = oracle.evaluate(scene_ids, trajectory, batch_id=f"eval{batch_i}")
@@ -193,6 +182,8 @@ def main() -> int:
                 print(json.dumps({"event": "oracle_error", "batch": batch_i, "error": repr(error)}), flush=True)
             assignment = trainer.hungarian_xy(trajectory, targets["gt_trajectory"], targets["gt_valid"])
             metrics = trainer.batch_eval_metrics(scorer, logits, trajectory, targets, assignment, labels, labels_ok, device)
+            nearest_ade, supervised = trainer.nearest_gt_ade(
+                trajectory, targets["gt_trajectory"], targets["gt_valid"])
             selected, _utility = scorer.select(logits)
 
         acc += metrics.cpu()
@@ -204,6 +195,8 @@ def main() -> int:
         gtvalid_np = targets["gt_valid"].cpu().numpy()
         sel_np = selected.cpu().numpy()
         fs_np = labels.final_score.cpu().numpy() if labels_ok else None
+        near_np = nearest_ade.cpu().numpy()
+        sup_np = supervised.cpu().numpy()
 
         for row in range(size):
             token = scene_ids[row]
@@ -212,8 +205,10 @@ def main() -> int:
                 verified += 1
             ade_pairs = [(traj_np[row, c, :, :2] - gt_np[row, g, :, :2]) for g, c in assignment[row].as_pairs()]
             ade_row = float(np.mean([np.linalg.norm(d, axis=-1).mean() for d in ade_pairs])) if ade_pairs else float("nan")
+            row_near = near_np[row][sup_np[row]]
             rec: dict = {"scene_id": token, "n_valid_gt": int(gtvalid_np[row].sum()),
-                         "matched_gt_ade_m": round(ade_row, 4)}
+                         "matched_gt_ade_m": round(ade_row, 4),
+                         "all64_nearest_gt_ade_m": (round(float(row_near.mean()), 4) if row_near.size else None)}
             if fs_np is not None:
                 sel_idx = int(sel_np[row])
                 rec.update({
@@ -236,12 +231,15 @@ def main() -> int:
 
     denom_scene = max(float(acc[5].item()), 1.0)
     denom_ade = max(float(acc[4].item()), 1.0)
+    denom_near = max(float(acc[7].item()), 1.0)
     summary = {
         "checkpoint": str(args.checkpoint),
         "opt_step": opt_step,
         "epoch": epoch,
         "lineage": "nvs_v6_wan_e2e",
-        "use_all_native_tokens": use_all_native,
+        "depth": meta["depth"],
+        "heads": meta["heads"],
+        "target_dim": meta["target_dim"],
         "scene_tokens": int(model.scene_tokens),
         "split": "navtest (held-out)",
         "scoring": "official navsim pdm_score path (official MetricCache + official PDMScorer)",
@@ -255,6 +253,7 @@ def main() -> int:
         "oracle_best_pdms": round(float(acc[1].item()) / denom_scene, 4),
         "oracle_match_rate": round(float(acc[2].item()) / denom_scene, 4),
         "matched_gt_ade_m": round(float(acc[3].item()) / denom_ade, 4),
+        "all64_nearest_gt_ade_m": round(float(acc[6].item()) / denom_near, 4),
         "noscorer_mean64_pdms": round(ns_mean_sum / max(ns_count, 1), 4),
         "noscorer_cand0_pdms": round(ns_cand0_sum / max(ns_count, 1), 4),
         "oracle_failures": oracle_failures,

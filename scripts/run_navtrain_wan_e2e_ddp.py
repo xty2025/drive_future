@@ -510,6 +510,124 @@ class JointStage2Module(nn.Module):
         return (outputs.endpoint, flow.velocity, flow.velocity_target, outputs.predicted_register,
                 outputs.endpoint.detach(), logits)
 
+    @torch.no_grad()
+    def inference(self, observation: Observation, source: torch.Tensor, modes: torch.Tensor):
+        """The deployed single forward: the anchor prior denoised once at sigma = 1.
+
+        Evaluation has no GT, so ``sigma = 0`` endpoint is set to the anchor itself.
+        ``add_noise`` then returns the anchor unchanged and ``recover`` subtracts the
+        full predicted velocity -- algebraically the same expression the training
+        forward uses, which is why eval cannot drift from the trained path.
+        ``action_sampling_loops`` stays 0: no rollout here either.
+        """
+        timestep = torch.full(
+            (source.shape[0],), INFERENCE_SIGMA * self.model.flow.num_train_timesteps,
+            device=source.device, dtype=source.dtype,
+        )
+        flow = self.model.forward_flow(observation, source, modes, source, timestep)
+        outputs = flow.pairs
+        logits = self.scorer(outputs.scene_context, outputs.trajectory, outputs.predicted_register)
+        return outputs.endpoint, outputs.trajectory, logits
+
+
+def build_generator_and_scorer(
+    *,
+    target_dim: int = 256,
+    heads: int = 4,
+    depth: int = 8,
+    dino_checkpoint: str = DEFAULT_DINO,
+    wan_backbone: str = DEFAULT_WAN_BACKBONE,
+    grad_checkpointing: bool = False,
+    device: torch.device | None = None,
+) -> tuple[DirectedPairDiT, ScratchDrivoRScorer]:
+    """The one construction path shared by training and both evaluators.
+
+    Every hyperparameter here must equal Stage 1's, or ``--stage1-checkpoint`` and a
+    Stage 2 ``--checkpoint`` cannot load with ``strict=True``: the LoRA rank sets the
+    adapter shapes, ``target_dim`` the width, and ``heads`` the Wan payload's
+    ``num_heads`` (4 at ``hidden_dim=256``, since Wan's own convention is
+    ``num_heads * attn_head_dim == hidden_dim``).  ``dino_image_hw`` is DrivoR's
+    official 672x1148 so the patch16 grid -- and therefore the position embeddings --
+    match the checkpoint the Student was tuned against.
+    """
+    model = DirectedPairDiT(
+        d_model=target_dim,
+        heads=heads,
+        ffn_dim=4 * target_dim,
+        depth=depth,
+        num_scene_tokens=DRIVOR_NUM_SCENE_TOKENS,
+        dino_checkpoint=dino_checkpoint,
+        dino_image_hw=DRIVOR_OFFICIAL_IMAGE_HW,
+        dino_lora_rank=DRIVOR_LORA_RANK,
+        dino_grad_checkpointing=grad_checkpointing,
+        wan_backbone_path=wan_backbone if Path(wan_backbone).exists() else None,
+    )
+    scorer = ScratchDrivoRScorer(
+        d_model=target_dim, heads=1, ffn_dim=4 * target_dim,
+        decoder_layers=4, scene_tokens=model.scene_tokens,
+    )
+    if device is not None:
+        model, scorer = model.to(device), scorer.to(device)
+    return model, scorer
+
+
+def load_joint_checkpoint(
+    checkpoint: str | Path,
+    *,
+    device: torch.device,
+    depth: int = 0,
+    heads: int = 0,
+    target_dim: int = 0,
+    dino_checkpoint: str = "",
+    wan_backbone: str = "",
+    grad_checkpointing: bool = False,
+) -> tuple[JointStage2Module, DirectedPairDiT, ScratchDrivoRScorer, dict[str, Any]]:
+    """Restore a Stage 2 checkpoint at the geometry it was trained with.
+
+    A falsy override means "trust the checkpoint": its ``config`` is the trainer's
+    own argparse namespace, so depth/heads/target_dim/dino_checkpoint are exactly
+    the values that produced the state_dict.  Guessing them instead makes
+    ``strict=True`` fail on the LoRA and Wan shapes -- or worse, silently builds a
+    different scene-token layout.  ``weights_only=True`` because the payload is
+    tensors plus ints plus that namespace; nothing here needs arbitrary unpickling.
+    """
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+
+    def resolved(key: str, override: Any, fallback: Any) -> Any:
+        return override if override not in (0, "", None) else config.get(key, fallback)
+
+    resolved_depth = int(resolved("depth", depth, 8))
+    resolved_heads = int(resolved("heads", heads, 4))
+    resolved_dim = int(resolved("target_dim", target_dim, 256))
+    resolved_dino = str(resolved("dino_checkpoint", dino_checkpoint, DEFAULT_DINO))
+    resolved_wan = str(resolved("wan_backbone", wan_backbone, DEFAULT_WAN_BACKBONE))
+    model, scorer = build_generator_and_scorer(
+        target_dim=resolved_dim, heads=resolved_heads, depth=resolved_depth,
+        dino_checkpoint=resolved_dino, wan_backbone=resolved_wan,
+        grad_checkpointing=grad_checkpointing, device=device,
+    )
+    model.load_state_dict(ckpt["model"], strict=True)
+    scorer.load_state_dict(ckpt["scorer"], strict=True)
+    model.eval()
+    scorer.eval()
+    meta = {
+        "checkpoint": str(checkpoint),
+        "opt_step": int(ckpt.get("opt_step", -1)),
+        "epoch": int(ckpt.get("epoch", -1)),
+        "depth": resolved_depth,
+        "heads": resolved_heads,
+        "target_dim": resolved_dim,
+        "dino_checkpoint": resolved_dino,
+        "wan_backbone": resolved_wan,
+        "scene_tokens": int(model.scene_tokens),
+        "model_tensors": len(ckpt["model"]),
+        "scorer_tensors": len(ckpt["scorer"]),
+    }
+    del ckpt
+    net = JointStage2Module(model, scorer).to(device).eval()
+    return net, model, scorer, meta
+
 
 def first_valid_gt(gt_trajectory: torch.Tensor, gt_valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Reduce multi-GT [B,K,8,3] to each scene's first valid GT [B,8,3] for mine_pair.
@@ -585,6 +703,22 @@ def schedule_factor(step: int, total: int, warmup: int) -> float:
 # Eval metrics from the labels/logits the training step already produced (free).
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
+def nearest_gt_ade(
+    trajectory: torch.Tensor, gt_trajectory: torch.Tensor, gt_valid: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[B,M]`` ADE of every candidate against its own nearest valid GT, plus the mask.
+
+    Shared by ``batch_eval_metrics`` and the evaluators' per-scene records so the
+    batch sum and the per-scene numbers cannot drift apart.
+    """
+    nearest, supervised = nearest_gt_index(trajectory, gt_trajectory, gt_valid)
+    batch, candidates = nearest.shape
+    rows = torch.arange(batch, device=nearest.device).view(batch, 1).expand(batch, candidates)
+    gt_xy = gt_trajectory[rows, nearest][:, :, :, :2]
+    return (trajectory[..., :2] - gt_xy).norm(dim=-1).mean(dim=-1), supervised
+
+
+@torch.no_grad()
 def batch_eval_metrics(
     scorer: ScratchDrivoRScorer,
     logits: torch.Tensor,
@@ -597,11 +731,11 @@ def batch_eval_metrics(
 ) -> torch.Tensor:
     """Return [sel, oracle_best, match, ade, ade_n, score_ok, near_ade, near_n] sums.
 
-    ``ade`` is the Hungarian-pair ADE: it measures the few candidates that won the
-    matching, so it stays low even when the other 60 are nonsense.  ``near_ade``
+    ``ade`` is the Hungarian-pair ADE: it measures only the few candidates that won
+    the matching, so it stays low even when the other 60 are nonsense.  ``near_ade``
     is every supervised candidate against its own nearest valid GT, which is the
-    number that actually reports overall set quality -- the user's complaint was
-    exactly that only the matched few looked good.
+    number that reports overall set quality.  Reporting the matched pair alone would
+    hide a collapsed candidate set.
     """
     out = torch.zeros(8, device=device)
     ade_sum = 0.0
@@ -614,13 +748,9 @@ def batch_eval_metrics(
     if ade_n:
         out[3] = ade_sum
         out[4] = float(ade_n)
-    nearest, supervised = nearest_gt_index(trajectory, targets["gt_trajectory"], targets["gt_valid"])
+    nearest_ade, supervised = nearest_gt_ade(trajectory, targets["gt_trajectory"], targets["gt_valid"])
     if bool(supervised.any()):
-        batch, candidates = nearest.shape
-        rows = torch.arange(batch, device=nearest.device).view(batch, 1).expand(batch, candidates)
-        gt_xy = targets["gt_trajectory"][rows, nearest][:, :, :, :2]
-        per_candidate = (trajectory[..., :2] - gt_xy).norm(dim=-1).mean(dim=-1)
-        masked = per_candidate[supervised]
+        masked = nearest_ade[supervised]
         out[6] = masked.sum()
         out[7] = float(masked.numel())
     if labels_ok:
@@ -780,26 +910,15 @@ def main() -> int:
     )
 
     # ---- model / scorer / oracle ------------------------------------------ #
-    # Every hyperparameter here must equal Stage 1's, or --stage1-checkpoint cannot
-    # load with strict=True: LoRA rank sets the adapter shapes, target_dim the width,
-    # heads the Wan payload's num_heads (4 at hidden_dim=256, since Wan's own
-    # convention is num_heads * attn_head_dim == hidden_dim).
-    model = DirectedPairDiT(
-        d_model=args.target_dim,
+    model, scorer = build_generator_and_scorer(
+        target_dim=args.target_dim,
         heads=args.heads,
-        ffn_dim=4 * args.target_dim,
         depth=args.depth,
-        num_scene_tokens=DRIVOR_NUM_SCENE_TOKENS,
         dino_checkpoint=args.dino_checkpoint,
-        dino_image_hw=DRIVOR_OFFICIAL_IMAGE_HW,
-        dino_lora_rank=DRIVOR_LORA_RANK,
-        dino_grad_checkpointing=args.grad_checkpointing,
-        wan_backbone_path=args.wan_backbone if Path(args.wan_backbone).exists() else None,
-    ).to(device)
-    scorer = ScratchDrivoRScorer(
-        d_model=args.target_dim, heads=1, ffn_dim=4 * args.target_dim,
-        decoder_layers=4, scene_tokens=model.scene_tokens,
-    ).to(device)
+        wan_backbone=args.wan_backbone,
+        grad_checkpointing=args.grad_checkpointing,
+        device=device,
+    )
     if args.wan_backbone and not Path(args.wan_backbone).exists():
         log0(dctx, {"event": "warn", "message": f"Wan backbone {args.wan_backbone} not found; theta starts random"})
 
@@ -814,7 +933,9 @@ def main() -> int:
         del stage1
 
     if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        # weights_only=True: the payload is state_dicts plus ints plus this script's
+        # own argparse namespace, so nothing here needs arbitrary unpickling.
+        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=True)
         model.load_state_dict(resume_ckpt["model"], strict=True)
         scorer.load_state_dict(resume_ckpt["scorer"], strict=True)
         if dctx.main:

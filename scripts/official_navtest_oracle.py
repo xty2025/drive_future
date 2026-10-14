@@ -32,7 +32,7 @@ from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PD
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import MultiMetricIndex, WeightedMetricIndex
 
-from nvs_v6_wan.oracle import HEAD_INDICES, OnlineOracle, OracleLabels, _hash_object, _hash_tensor
+from nvs_v6_wan_e2e.oracle import HEAD_INDICES, OnlineOracle, OracleLabels, _hash_object, _hash_tensor
 
 PROPOSAL_SAMPLING = TrajectorySampling(num_poses=40, interval_length=0.1)
 

@@ -2,10 +2,14 @@
 
 Strictly additive: this script only IMPORTS ``nvs_v6_wan_e2e`` and reuses the joint
 trainer's own helpers (``build_scene_index`` / ``NavtrainSceneDataset`` /
-``collate`` / ``batch_to_device`` / ``JointStage2Module`` / ``batch_eval_metrics``
-/ ``hungarian_xy`` / ``DrivoRBatchMetricCacheOracle``) so the offline numbers are
-produced by the exact same code path as the in-training eval.  It never edits any
-package file.
+``collate`` / ``batch_to_device`` / ``build_generator_and_scorer`` /
+``JointStage2Module.inference`` / ``batch_eval_metrics`` / ``hungarian_xy`` /
+``DrivoRBatchMetricCacheOracle``) so the offline numbers are produced by the exact
+same code path as the in-training eval.  It never edits any package file.
+
+Candidates come from ``JointStage2Module.inference``, the deployed single forward:
+the 64-anchor prior is denoised once at ``sigma = 1`` and inverted algebraically to
+a metric trajectory.  No rollout, so what is scored here is what the model ships.
 
 What it reports for a checkpoint trained on ``navtrain``:
   * selected PDMS   -- official DrivoR ``get_sub_score`` of the candidate the
@@ -13,7 +17,9 @@ What it reports for a checkpoint trained on ``navtrain``:
   * oracle-best PDMS-- best official score among the 64 candidates (upper bound).
   * oracle-match    -- how often the scorer picks the exact argmax candidate.
   * matched-GT ADE  -- mean L2 (m) between each Hungarian-matched candidate and
-                       its official Multi-GT trajectory.
+                       its official Multi-GT trajectory.  This hides the losers, so
+                       ``batch_eval_metrics`` also reports the nearest-GT ADE over
+                       all 64 candidates.
 
 For the first ``--bev-scenes`` scenes it renders a top-down ego-BEV (x forward,
 y left, meters) overlaying the ego history, all 64 faint candidates (colored by
@@ -270,8 +276,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--depth", type=int, default=0, help="0 = read depth from checkpoint config")
-    parser.add_argument("--use-all-native-tokens", action="store_true",
-                        help="force all-native 1007-token scene (default: read from checkpoint config)")
+    parser.add_argument("--heads", type=int, default=0,
+                        help="0 = read from checkpoint config (the Wan payload fixes num_heads=4 at hidden_dim=256)")
+    parser.add_argument("--target-dim", type=int, default=0, help="0 = read from checkpoint config")
+    parser.add_argument("--wan-backbone", default=trainer.DEFAULT_WAN_BACKBONE,
+                        help="only needed to build theta before the checkpoint overwrites it")
+    parser.add_argument("--grad-checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=17)
     return parser.parse_args()
 
@@ -297,31 +307,18 @@ def main() -> int:
     Path(index_dir).mkdir(parents=True, exist_ok=True)
 
     # ---- load checkpoint --------------------------------------------------- #
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
-    depth = args.depth or int(config.get("depth", 8))
-    dino = args.dino_checkpoint or config.get("dino_checkpoint", trainer.DEFAULT_DINO)
-    opt_step = int(ckpt.get("opt_step", -1))
-    epoch = int(ckpt.get("epoch", -1))
-    use_all_native = bool(config.get("use_all_native_tokens", False)) or args.use_all_native_tokens
-    print(json.dumps({"event": "ckpt_loaded", "checkpoint": args.checkpoint,
-                      "opt_step": opt_step, "epoch": epoch, "depth": depth,
-                      "use_all_native_tokens": use_all_native}), flush=True)
-
-    model = trainer.DirectedPairDiT(
-        d_model=256, heads=8, ffn_dim=1024, depth=depth,
-        dino_checkpoint=dino, dino_model_name="vit_large_patch16_dinov3.lvd1689m",
-        dino_lora_rank=16, dino_lora_alpha=16.0,
-        use_all_native_tokens=use_all_native,
+    net, model, scorer, meta = trainer.load_joint_checkpoint(
+        args.checkpoint,
+        device=device,
+        depth=args.depth,
+        heads=args.heads,
+        target_dim=args.target_dim,
+        dino_checkpoint=args.dino_checkpoint,
+        wan_backbone=args.wan_backbone,
+        grad_checkpointing=args.grad_checkpointing,
     )
-    model.load_state_dict(ckpt["model"], strict=True)
-    scorer = trainer.ScratchDrivoRScorer(
-        d_model=256, heads=1, ffn_dim=1024, decoder_layers=4, scene_tokens=model.scene_tokens
-    )
-    scorer.load_state_dict(ckpt["scorer"], strict=True)
-    model.to(device).eval()
-    scorer.to(device).eval()
-    net = trainer.JointStage2Module(model, scorer).to(device).eval()
+    print(json.dumps({"event": "ckpt_loaded", **meta}), flush=True)
+    opt_step, epoch = meta["opt_step"], meta["epoch"]
 
     # ---- deterministic scene subset (reuse sidecar index when present) ----- #
     index_start = time.time()
@@ -366,7 +363,7 @@ def main() -> int:
         mode_codes = modes.expand_for_batch(size, device)
         source = initializer.clean(observation.ego_history, mode_codes)
         with torch.no_grad():
-            endpoint, trajectory, logits = net(observation, source, mode_codes)
+            endpoint, trajectory, logits = net.inference(observation, source, mode_codes)
             try:
                 labels = oracle.evaluate(scene_ids, trajectory, batch_id=f"eval{batch_i}")
                 labels_ok = (not labels.failure_diagnostics) and bool(labels.final_valid.all())
@@ -438,6 +435,7 @@ def main() -> int:
 
     denom_scene = max(float(acc[5].item()), 1.0)
     denom_ade = max(float(acc[4].item()), 1.0)
+    denom_near = max(float(acc[7].item()), 1.0)
     summary = {
         "checkpoint": args.checkpoint,
         "opt_step": opt_step,
@@ -450,6 +448,8 @@ def main() -> int:
         "oracle_best_pdms": round(float(acc[1].item()) / denom_scene, 4),
         "oracle_match_rate": round(float(acc[2].item()) / denom_scene, 4),
         "matched_gt_ade_m": round(float(acc[3].item()) / denom_ade, 4),
+        "all64_nearest_gt_ade_m": round(float(acc[6].item()) / denom_near, 4),
+        "all64_nearest_gt_candidates": int(acc[7].item()),
         "noscorer_mean64_pdms": round(ns_mean_sum / max(ns_count, 1), 4),
         "noscorer_cand0_pdms": round(ns_cand0_sum / max(ns_count, 1), 4),
         "oracle_failures": oracle_failures,

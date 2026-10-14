@@ -127,19 +127,30 @@ def load_v6_config(path: str | Path) -> dict[str, Any]:
     _require(model.get("action_codec") == "drivor_metric_xy_heading", "Action A must be DrivoR-native metric xy/heading")
     forbidden = {
         # The e2e Stage 1 conditions the Register on the metric trajectory, which
-        # the shared v6 spec explicitly withdrew (its "attack 5").  That ban stays
-        # in force for nvs_v6/nvs_v6_wan via config_v6_final.yaml; this loader
-        # governs nvs_v6_wan_e2e only, whose Stage 1 is a trajectory-conditioned
-        # future representation and cannot work without the trajectory as input.
+        # the shared v6 spec explicitly withdrew (its "attack 5").  That withdrawal
+        # no longer binds anything: this loader governs nvs_v6_wan_e2e only, whose
+        # Stage 1 is a trajectory-conditioned future representation and cannot work
+        # without the trajectory as input.
         "physical_trajectory_to_register_readout": True,
         # The directed attention contract is untouched: R still never reads A.
         "register_reads_action": False,
         "action_reads_register": True,
         "register_self_causal": False,
-        "random_flow_time_training": False,
     }
     for key, expected in forbidden.items():
         _require(model.get(key) == expected, f"conflicting v6 model flag: {key}={model.get(key)!r}")
+    # theta is a rectified-flow denoiser, so training must draw a random timestep
+    # per scene per forward.  The deployed path is still a single forward at
+    # sigma = 1 (action_sampling_loops: 0) -- the random time is a training-time
+    # property only, and the two flags together pin that split.
+    _require(
+        model.get("random_flow_time_training") is True,
+        "Stage 2 must sample a random flow timestep per forward",
+    )
+    _require(
+        model.get("action_sampling_loops") == 0,
+        "one forward must yield a metric trajectory; no rollout at train or eval time",
+    )
     _require(
         model.get("register_init_inputs") == ["learned_time_queries", "metric_source_trajectory", "immutable_mode_code"],
         "R0 must carry the metric trajectory; the mode code is optional and is dropped at Stage 1",

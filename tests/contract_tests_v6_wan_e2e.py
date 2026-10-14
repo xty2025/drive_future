@@ -206,9 +206,9 @@ class FakeOracle:
 
 
 def test_strict_config_loader_rejects_direction_changes():
-    # The e2e package has its own config: `config_v6_final.yaml` is the shared
-    # nvs_v6/nvs_v6_wan spec file and still asserts the 66-token, 12-wide ego,
-    # 3-way-detach contract those packages implement.
+    # `config_v6_wan_e2e.yaml` is this package's spec file.  The loader is strict,
+    # so a flag that contradicts the directed contract fails here rather than
+    # silently changing what the model computes.
     config = load_v6_config(REPO_ROOT / "config" / "config_v6_wan_e2e.yaml")
     assert config["model"]["register_reads_action"] is False
     assert config["model"]["action_reads_register"] is True
@@ -774,9 +774,15 @@ def test_norm_odo_is_simwam_min_max_and_round_trips():
 
 
 def test_wan_scheduler_matches_simwam_source():
-    from simwam.models.wan22.schedulers.scheduler_continuous import (
-        WanContinuousFlowMatchScheduler as SimwamScheduler,
+    # vendor/ trees are gitignored except the force-added DrivoR sources, so SimWAM
+    # is present on the training machine but not on a fresh clone.  This test diffs
+    # our port against the upstream scheduler rather than against hard-coded
+    # numbers, which is only meaningful when that source is actually there.
+    scheduler_continuous = pytest.importorskip(
+        "simwam.models.wan22.schedulers.scheduler_continuous",
+        reason="vendor/SimWAM is not checked out; cannot diff against the upstream scheduler",
     )
+    SimwamScheduler = scheduler_continuous.WanContinuousFlowMatchScheduler
 
     scheduler = WanContinuousFlowMatchScheduler()
     reference = SimwamScheduler()

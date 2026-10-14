@@ -1,6 +1,6 @@
 """Merge sharded navtest official-PDMS results back into one result.json.
 
-``eval_navtest_official_pdms.py --shard-count N`` splits the scene list across N
+``eval_navtest_official_pdms_e2e.py --shard-count N`` splits the scene list across N
 independent processes; this recombines them and recomputes the summary from the
 merged per-scene records, so every arm (sharded) and the baseline (unsharded or
 sharded) are reduced by exactly the same code.
@@ -75,6 +75,8 @@ def main() -> int:
     scored = [r for r in per_scene if "selected_pdms_official" in r]
     ade = [r["matched_gt_ade_m"] for r in per_scene
            if r.get("matched_gt_ade_m") is not None and np.isfinite(r["matched_gt_ade_m"])]
+    near_ade = [r["all64_nearest_gt_ade_m"] for r in per_scene
+                if r.get("all64_nearest_gt_ade_m") is not None and np.isfinite(r["all64_nearest_gt_ade_m"])]
     cand0 = [(r["noscorer_cand0_official"] if r.get("noscorer_cand0_official") is not None else 0.0)
              for r in scored if "noscorer_cand0_official" in r]
     summary: dict[str, Any] = {key: shards[0]["summary"].get(key) for key in SUMMARY_KEYS_SAME}
@@ -86,6 +88,7 @@ def main() -> int:
         "oracle_best_pdms": mean([r["oracle_best_pdms_official"] for r in scored]),
         "oracle_match_rate": mean([float(r["oracle_match"]) for r in scored]),
         "matched_gt_ade_m": mean(ade),
+        "all64_nearest_gt_ade_m": mean(near_ade) if near_ade else None,
         "ade_aggregation": "mean of per-scene matched-GT ADE (scene-weighted)",
         "noscorer_mean64_pdms": mean([r["noscorer_mean64_official"] for r in scored
                                       if "noscorer_mean64_official" in r]),

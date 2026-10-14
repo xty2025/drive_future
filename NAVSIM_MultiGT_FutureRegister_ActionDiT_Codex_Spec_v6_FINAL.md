@@ -3,6 +3,19 @@
 
 **日期：2026-10-09｜规范 ID：`navsim_future_register_R_to_A_v6`。**
 
+> **实现状态说明（2026-10-14 追加，不改动以下任何需求正文）。**
+> 本规范面向的 `src/nvs_v6` 包已在收敛中删除，仓库现在只有 `src/nvs_v6_wan_e2e` 一条谱系。
+> 下面这些**工程起点**已被真实实现取代，读代码时以 `config/config_v6_wan_e2e.yaml` 与
+> `src/nvs_v6_wan_e2e/config.py` 的严格 loader 为准，详见 `README.md` 与 `AGENTS.md`：
+> 66 个 Scene token → **81**（5 帧 × 16 query + 1 ego）；224×224 视觉输入 → DrivoR 官方
+> **672×1148**（4 列零填充到 672×1152，patch16 grid 42×72）；12 宽 ego（含 pad0）→ **11 宽**
+> （`pose3,velocity2,acceleration2,command4`，无 pad）；`xy_scale_m: 20.0` 归一化轨迹 →
+> **米制 `[x,y,heading]`，全程不 rescale**；scorer 输入全 detach → **只 detach proposals，
+> scene K/V 不 detach**（逐字照抄 DrivoR）；`endpoint = source + head(...)` 单步回归 →
+> **Wan2.2 ActionDiT 的 rectified-flow 单次前向**（σ=1 锚点先验，零 rollout）。
+> 本规范里的**用户硬约束**（R→Action 单向注意力、Multi-GT + Hungarian、在线 PDMS 打分、
+> 不得用未来 RGB/GT 轨迹做输入、不得把随机张量冒烟写成真实 NAVSIM 验证）全部仍然有效。
+
 本文件是当前唯一需求基线，取代 v1、v2、v3、v3.1、v4、v5 及此前图文中互相冲突的默认设置。这里“FINAL”表示本轮架构和工程接口定稿，不表示已经在用户的 NAVSIM 数据上运行，也不表示性能/安全性已经证明。
 
 **最重要的方向：Action 可以读取预测 Register；Register 不能读取 Action。**
