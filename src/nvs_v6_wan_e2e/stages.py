@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -10,12 +10,15 @@ import torch
 from .data import Observation, PairTargets
 from .losses import (
     assert_disjoint_parameter_groups,
+    dense_future_l1,
+    flow_velocity_loss,
+    gather_flow_data,
     hungarian_xy,
-    paired_future_l1,
-    paired_residual_velocity_mse,
+    identity_future_l1,
+    multigt_trajectory_loss,
 )
 from .model import DirectedPairDiT, parameter_groups
-from .lora import freeze_base_keep_lora
+from .vision import freeze_backbone_keep_lora
 from .modes import ImmutableModeBuffer, StructuredSourceInitializer
 from .oracle import OnlineOracle
 from .scorer import ScratchDrivoRScorer
@@ -24,7 +27,7 @@ from .scorer import ScratchDrivoRScorer
 @dataclass
 class Stage1Result:
     loss_future: torch.Tensor
-    assignment: list[Any]
+    supervised_rows: int
 
 
 @dataclass
@@ -34,6 +37,9 @@ class Stage2Result:
     loss_score: torch.Tensor
     assignment: list[Any]
     oracle: Any
+    trajectory_terms: dict[str, torch.Tensor] = field(default_factory=dict)
+    loss_velocity: torch.Tensor = field(default_factory=lambda: torch.zeros(()))
+    timestep: torch.Tensor | None = None
 
 
 def _set_generator_trainability(model: DirectedPairDiT, stage: int) -> None:
@@ -41,23 +47,21 @@ def _set_generator_trainability(model: DirectedPairDiT, stage: int) -> None:
         parameter.requires_grad_(True)
     for name, parameter in model.named_parameters():
         if (
-            ".base." in name
+            ".qkv.qkv." in name
             or name.endswith("student.patch.weight")
             or name.endswith("student.patch.bias")
-            or name.startswith("eta.student.norm.")
             or name.startswith("_unused")
         ):
             parameter.requires_grad_(False)
-    # Re-applying stage trainability must never unfreeze the DINOv3 base.
-    # Only LoRA adapters (plus the NVS scene-query/projection modules outside
-    # the backbone) remain trainable.
+    # Re-applying stage trainability must never unfreeze the DINOv3 base.  Only
+    # DrivoR's q/v LoRA adapters plus the NVS modules outside the backbone
+    # (scene_embeds, neck, hist_encoding, scene_blocks) stay trainable.
     student = model.eta.student
     if hasattr(student, "backbone"):
-        freeze_base_keep_lora(student.backbone)
+        freeze_backbone_keep_lora(student.backbone)
     if stage == 1:
         for parameter in model.theta.parameters():
             parameter.requires_grad_(False)
-        model.theta_time_embedding.requires_grad_(False)
 
 
 def _set_scorer_trainability(scorer: ScratchDrivoRScorer, enabled: bool) -> None:
@@ -92,22 +96,26 @@ def stage1_step(
     targets: PairTargets,
     model: DirectedPairDiT,
     optimizer: torch.optim.Optimizer,
-    modes: ImmutableModeBuffer,
-    source_initializer: StructuredSourceInitializer,
 ) -> Stage1Result:
+    """Trajectory-conditioned future representation training.
+
+    The register is conditioned on each scene's own GT trajectories, so the row
+    pairing is the identity and no anchor codebook or Hungarian assignment takes
+    part: row ``k`` must predict the compressed future of GT ``k``.  ``modes`` is
+    deliberately not passed, because a mode code constant per row index would let
+    the network identify the GT from its row alone and skip the trajectory.
+    """
+
     model.train()
     _set_generator_trainability(model, stage=1)
     optimizer.zero_grad(set_to_none=True)
-    mode_codes = modes.expand_for_batch(observation.rgb_history.shape[0], observation.rgb_history.device)
-    predicted_register = model.forward_register_only(observation, mode_codes)
-    with torch.no_grad():
-        clean_source = source_initializer.clean(observation.ego_history, mode_codes)
-        clean_trajectory = _decode_clean(clean_source)
-        assignment = hungarian_xy(clean_trajectory, targets.gt_trajectory, targets.gt_valid)
-    loss_future = paired_future_l1(predicted_register, targets, assignment)
+    source = targets.gt_trajectory
+    predicted_register = model.forward_register_only(observation, source)
+    loss_future = identity_future_l1(predicted_register, targets)
     loss_future.backward()
     optimizer.step()
-    return Stage1Result(loss_future.detach(), assignment)
+    supervised_rows = int(targets.gt_valid.sum())
+    return Stage1Result(loss_future.detach(), supervised_rows)
 
 
 def stage2_step(
@@ -124,20 +132,49 @@ def stage2_step(
     lambda_future: float = 0.1,
     lambda_action: float = 1.0,
     lambda_score: float = 1.0,
+    lambda_velocity: float = 1.0,
+    dense_weight: float = 0.1,
+    diversity_weight: float = 1.0,
+    dense_gate_m: float = 8.0,
     batch_id: str = "",
 ) -> Stage2Result:
+    """Joint generator+scorer step with DrivoR's gradient path and dense multi-GT targets.
+
+    The ActionDiT is run as a rectified flow (see :mod:`nvs_v6_wan_e2e.flow`): one
+    timestep is sampled per scene per forward, the anchor grid is interpolated
+    toward each candidate's nearest GT, and the same forward both predicts the
+    velocity and inverts it back to a trajectory -- no rollout.  Two terms
+    supervise that trajectory:
+
+    * ``loss_velocity`` -- SimWAM's ``v_loss``, MSE against ``anchor - GT`` in the
+      normalized action space, bell-weighted by ``t``.
+    * ``loss_action`` -- DrivoR's own objective: L1 on the Hungarian-matched
+      (GT, candidate) pairs at full weight, plus a weak dense nearest-GT pull and
+      ``diversity_loss`` so the unmatched candidates are shaped rather than left
+      free.
+
+    The score gradient path is DrivoR's verbatim: proposals enter the scorer
+    detached while the Scene context stays attached, so ``loss_score`` shapes eta
+    but never theta/phi.
+    """
     model.train()
     scorer.train()
     _set_generator_trainability(model, stage=2)
     _set_scorer_trainability(scorer, True)
     opt_generator.zero_grad(set_to_none=True)
     opt_scorer.zero_grad(set_to_none=True)
-    mode_codes = modes.expand_for_batch(observation.rgb_history.shape[0], observation.rgb_history.device)
+    batch = observation.rgb_history.shape[0]
+    device = observation.rgb_history.device
+    mode_codes = modes.expand_for_batch(batch, device)
     # DrivoR proposals are deterministic for a fixed scene/model.  Keep the
     # ActionDiT source deterministic as well so score supervision and inference
-    # refer to the same candidate identities.
+    # refer to the same candidate identities; the flow's randomness lives in the
+    # sampled timestep, not in the anchor grid.
     source = source_initializer.clean(observation.ego_history, mode_codes)
-    outputs = model.forward_pairs(observation, source, mode_codes)
+    timestep = model.flow.sample_timestep((batch,), device, source.dtype)
+    flow_data = gather_flow_data(source, targets.gt_trajectory, targets.gt_valid)
+    flow = model.forward_flow(observation, source, mode_codes, flow_data, timestep)
+    outputs = flow.pairs
     # DrivoR-exact end-to-end: the Scene context is passed attached so the score
     # loss shapes eta (SceneEncoder + DINOv3 LoRA + scene_blocks).  Proposals and
     # the (ignored) register stay detached, so there is still no Score ->
@@ -151,13 +188,24 @@ def stage2_step(
     with torch.no_grad():
         oracle_labels = oracle.evaluate(scene_ids, outputs.trajectory.detach(), batch_id=batch_id)
         assignment = hungarian_xy(outputs.trajectory.detach(), targets.gt_trajectory, targets.gt_valid)
-    loss_action = paired_residual_velocity_mse(outputs.endpoint, source, targets.gt_encoded, assignment)
-    loss_future = paired_future_l1(outputs.predicted_register, targets, assignment)
+    trajectory_terms = multigt_trajectory_loss(
+        outputs.trajectory,
+        targets.gt_trajectory,
+        targets.gt_valid,
+        dense_weight=dense_weight,
+        diversity_weight=diversity_weight,
+        dense_gate_m=dense_gate_m,
+        assignment=assignment,
+    )
+    loss_action = trajectory_terms["loss_trajectory"]
+    loss_velocity = flow_velocity_loss(flow.velocity, flow.velocity_target, model.flow.weight(timestep))
+    loss_future = dense_future_l1(outputs.predicted_register, targets, outputs.trajectory)
     if not hasattr(scorer, "source_loss"):
         raise TypeError("production Stage 2 requires official DrivoRLoss.score_loss")
     loss_score = scorer.source_loss(score_logits, oracle_labels)
     (
         lambda_action * loss_action
+        + lambda_velocity * loss_velocity
         + lambda_future * loss_future
         + lambda_score * loss_score
     ).backward()
@@ -167,11 +215,13 @@ def stage2_step(
     opt_scorer.step()
     if hasattr(scorer, "record_comparison"):
         scorer.record_comparison(outputs.trajectory.detach(), oracle_labels)
-    return Stage2Result(loss_action.detach(), loss_future.detach(), loss_score.detach(), assignment, oracle_labels)
-
-
-def _decode_clean(encoded: torch.Tensor) -> torch.Tensor:
-    x = encoded[..., 0] * 20.0
-    y = encoded[..., 1] * 20.0
-    yaw = torch.atan2(encoded[..., 2], encoded[..., 3])
-    return torch.stack((x, y, yaw), dim=-1)
+    return Stage2Result(
+        loss_action.detach(),
+        loss_future.detach(),
+        loss_score.detach(),
+        assignment,
+        oracle_labels,
+        {key: value.detach() for key, value in trajectory_terms.items()},
+        loss_velocity.detach(),
+        timestep.detach(),
+    )

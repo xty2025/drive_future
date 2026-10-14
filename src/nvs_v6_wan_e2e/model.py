@@ -1,24 +1,58 @@
-"""NAVSIM v6-wan variant: same directed Scene/Action/Register generator, but the
-Action DiT blocks follow the Wan2.2 ``DiTBlock`` design (self-attn with QK
-RMSNorm + RoPE, cross-attn over ``[Scene | stopgrad(Register)]``, six-parameter
-adaLN modulation, GELU(tanh) FFN, modulated output Head).  All Wan-style modules
-are randomly initialized; no Wan checkpoint is ever loaded.  The v6 contracts
-(token order, directed reads, A0 feature addition, single-step residual-velocity
-endpoint readout) are preserved.
+"""NAVSIM v6-wan generator: DrivoR scene perception + Wan2.2 Action DiT.
+
+Three streams keep the v6 directed contract ``GROUP_ALLOW = ((1,0,0),(1,1,1),(1,0,1))``:
+
+* ``eta`` -- DrivoR's scene perception (DINOv3 with prepended scene queries and
+  q/v LoRA, see :mod:`nvs_v6_wan_e2e.vision`) plus DrivoR's ``hist_encoding``
+  ego token, fused by ``scene_blocks``.
+* ``phi`` -- the Future Register, reading ``[S, R]`` per layer and initialised
+  from the metric source trajectory, so one scene yields a different future per
+  candidate trajectory.
+* ``theta`` -- SimWAM's Wan2.2 ActionDiT at ``hidden_dim=256``
+  (:mod:`nvs_v6_wan_e2e.wan_dit`), reading ``[S, A, sg(R)]`` in Wan's
+  self+cross split.
+
+Trajectories are DrivoR-native metric ``[x, y, heading]`` in metres and radians
+with no rescaling.  The Action DiT is a rectified-flow model over them
+(:mod:`nvs_v6_wan_e2e.flow`): its ``Head`` emits a velocity, and one forward is
+inverted algebraically to a trajectory, so there is no rollout at train or
+inference time.  ``sigma = 0`` makes the flow state the clean action (Stage 1);
+``sigma = 1`` makes it the anchor prior, which is what
+:meth:`DirectedPairDiT.forward_pairs` deploys.
+
+The Register consumes the trajectory as an *initialisation feature*, never as an
+attention key: ``GROUP_ALLOW`` still forbids ``R<-A``, and Scene is still never
+updated by Action or Register.  Action and Register therefore share the same
+flow state as an input while remaining separate streams.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterator, Sequence
 
 import torch
 from torch import nn
 
-from .data import Observation, decode_trajectory
-from .dino_tokens import split_dinov3_tokens
-from .lora import LoRALinear, attach_lora, freeze_base_keep_lora
+from .data import Observation
+from .flow import INFERENCE_SIGMA, ActionFlow
+from .vision import (
+    DINOV3_MODEL_NAME,
+    DRIVOR_OFFICIAL_IMAGE_HW,
+    DRIVOR_LORA_RANK,
+    DRIVOR_NUM_SCENE_TOKENS,
+    DrivoRDinoV3Student,
+    freeze_backbone_keep_lora,
+)
+from .wan_dit import NvsActionDiT
+from .wan_init import load_action_dit_backbone
 
 GROUP_ALLOW = ((1, 0, 0), (1, 1, 1), (1, 0, 1))
+
+# DrivoR's observable ego vector: pose3, velocity2, acceleration2, command4.
+EGO_OBSERVABLE_DIM = 11
+EGO_STATUS_DIM = 7
+TRAJECTORY_STATE_DIM = 3
 
 
 def build_group_mask(ns: int, na: int, nr: int, device: torch.device | None = None) -> torch.Tensor:
@@ -43,306 +77,150 @@ class PairOutputs:
     predicted_register: torch.Tensor
 
 
+@dataclass
+class FlowOutputs:
+    """One noised training forward: the recovered trajectory plus its flow targets.
+
+    ``pairs`` carries exactly what the inference path returns, so the scorer and
+    the oracle consume the same object in both stages; the extra fields are what
+    :func:`nvs_v6_wan_e2e.losses.flow_velocity_loss` needs.
+    """
+
+    pairs: PairOutputs
+    noisy_action: torch.Tensor
+    velocity: torch.Tensor
+    velocity_target: torch.Tensor
+    timestep: torch.Tensor
+
+
 class SpatialStudent(nn.Module):
-    def __init__(self, d_model: int) -> None:
+    """Checkpoint-free stand-in emitting the DrivoR scene-query token budget."""
+
+    def __init__(self, output_dim: int, num_frames: int = 5, num_scene_tokens: int = DRIVOR_NUM_SCENE_TOKENS) -> None:
         super().__init__()
-        self.patch = nn.Conv2d(3, d_model, kernel_size=4, stride=4)
-        self.qkv = nn.Linear(d_model, d_model * 3)
-        self.proj = nn.Linear(d_model, d_model)
-        self.norm = nn.LayerNorm(d_model)
+        self.num_frames = num_frames
+        self.num_scene_tokens = num_scene_tokens
+        self.patch = nn.Conv2d(3, output_dim, kernel_size=16, stride=16)
+        self.pool = nn.AdaptiveAvgPool1d(num_scene_tokens)
         for parameter in self.patch.parameters():
             parameter.requires_grad_(False)
-        for parameter in self.qkv.parameters():
-            parameter.requires_grad_(False)
-        for parameter in self.proj.parameters():
-            parameter.requires_grad_(False)
-        for parameter in self.norm.parameters():
-            parameter.requires_grad_(False)
-        self.qkv = LoRALinear(self.qkv, rank=min(16, d_model), alpha=min(16, d_model))
-        self.proj = LoRALinear(self.proj, rank=min(16, d_model), alpha=min(16, d_model))
+        self.neck = nn.Linear(output_dim, output_dim)
 
-    def forward(self, images: torch.Tensor, output_tokens: int) -> torch.Tensor:
-        b, t, v, c, h, w = images.shape
-        images = images.reshape(b * t * v, c, h, w)
-        tokens = self.patch(images).flatten(2).transpose(1, 2)
-        if tokens.shape[1] < output_tokens:
-            tokens = torch.nn.functional.pad(tokens, (0, 0, 0, output_tokens - tokens.shape[1]))
-        tokens = tokens[:, :output_tokens]
-        qkv = self.qkv(tokens)
-        q, k, value = qkv.chunk(3, dim=-1)
-        attention = torch.softmax(q @ k.transpose(-1, -2) / (q.shape[-1] ** 0.5), dim=-1)
-        tokens = self.norm(tokens + self.proj(attention @ value))
-        return tokens.reshape(b, t, v, output_tokens, -1).mean(dim=2)
-
-
-class TimmDinoV3Student(nn.Module):
-    def __init__(
-        self,
-        checkpoint: str,
-        model_name: str = "vit_large_patch16_dinov3.lvd1689m",
-        output_dim: int = 256,
-        image_size: int = 224,
-        lora_rank: int = 16,
-        lora_alpha: float = 16.0,
-        lora_dropout: float = 0.0,
-        max_output_tokens: int = 32,
-        use_all_native_tokens: bool = False,
-    ) -> None:
-        super().__init__()
-        try:
-            import timm
-        except ImportError as error:
-            raise ImportError("timm is required for the real DINOv3 student") from error
-        if "dinov3" not in model_name:
-            raise ValueError("the NVS student token adapter only accepts DINOv3 backbones")
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=False,
-            checkpoint_path=checkpoint,
-            num_classes=0,
-        )
-        self.backbone_dim = int(getattr(self.backbone, "num_features", 1024))
-        self.image_size = int(image_size)
-        self.num_prefix_tokens = int(getattr(self.backbone, "num_prefix_tokens", 1))
-        if self.num_prefix_tokens < 1:
-            raise ValueError("DINOv3 backbone must expose a CLS token")
-        default_cfg = getattr(self.backbone, "default_cfg", {})
-        mean = default_cfg.get("mean", (0.485, 0.456, 0.406))
-        std = default_cfg.get("std", (0.229, 0.224, 0.225))
-        self.register_buffer("mean", torch.tensor(mean).view(1, 1, 1, 3), persistent=False)
-        self.register_buffer("std", torch.tensor(std).view(1, 1, 1, 3), persistent=False)
-        attached = attach_lora(
-            self.backbone,
-            names=("qkv", "proj"),
-            rank=lora_rank,
-            alpha=lora_alpha,
-        )
-        if not attached:
-            raise RuntimeError("DINOv3 backbone has no qkv/proj Linear modules for LoRA attachment")
-        freeze_base_keep_lora(self.backbone)
-        # DrivoR prepends trainable scene queries to the ViT sequence.  NVS
-        # keeps DINOv3's native CLS/register tokens too, so only the remaining
-        # output slots are injected as queries.  Image patches stay in every
-        # block's Q/K/V and are summarized into these tokens.
-        scene_query_init = (
-            torch.randn(max_output_tokens - self.num_prefix_tokens, self.backbone_dim) * 1e-6
-        )
-        if use_all_native_tokens:
-            # All-native mode emits every DINOv3 token and never injects scene
-            # queries.  Keep the tensor as a non-trainable buffer so it stays out
-            # of parameters()/the optimizer and DDP does not expect a gradient
-            # for it (which would otherwise force find_unused_parameters=True).
-            self.register_buffer("scene_queries", scene_query_init, persistent=False)
-        else:
-            self.scene_queries = nn.Parameter(scene_query_init)
-        self.output_projection = nn.Linear(self.backbone_dim, output_dim)
-        self.output_projection._v6_role = "eta"  # type: ignore[attr-defined]
-        self.train(True)
-
-    def train(self, mode: bool = True) -> "TimmDinoV3Student":
+    def train(self, mode: bool = True) -> "SpatialStudent":
         super().train(mode)
-        self.backbone.eval()
+        self.patch.eval()
         return self
 
-    def token_layout(self, output_tokens: int) -> dict[str, int]:
-        if output_tokens <= self.num_prefix_tokens:
-            raise ValueError("scene output must retain CLS, all registers, and at least one scene query")
-        patch_size = getattr(self.backbone.patch_embed, "patch_size", None)
-        if patch_size is None:
-            raise ValueError("DINOv3 patch embedding does not expose patch_size")
-        if isinstance(patch_size, int):
-            patch_size = (patch_size, patch_size)
-        if self.image_size % int(patch_size[0]) or self.image_size % int(patch_size[1]):
-            raise ValueError("configured image size must be divisible by the DINOv3 patch size")
-        patch_tokens = (self.image_size // int(patch_size[0])) * (self.image_size // int(patch_size[1]))
-        scene_queries = output_tokens - self.num_prefix_tokens
+    def token_layout(self) -> dict[str, int]:
         return {
-            "cls": 1,
-            "registers": self.num_prefix_tokens - 1,
-            "scene_queries": scene_queries,
-            "image_patches": patch_tokens,
-            "native_tokens": self.num_prefix_tokens + patch_tokens,
-            "backbone_qkv_tokens": self.num_prefix_tokens + scene_queries + patch_tokens,
-            "output_tokens": output_tokens,
+            "scene_queries_per_frame": self.num_scene_tokens,
+            "frames": self.num_frames,
+            "output_tokens": self.num_frames * self.num_scene_tokens,
+            "position_encoding": "synthetic_conv_patch_no_dinov3",
         }
 
-    def _forward_features_with_scene_queries(
-        self, images: torch.Tensor, scene_query_count: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        backbone = self.backbone
-        tokens = backbone.patch_embed(images)
-        positional = backbone._pos_embed(tokens)
-        if isinstance(positional, tuple):
-            tokens, rope = positional
-        else:
-            tokens, rope = positional, None
-        queries = self.scene_queries[:scene_query_count].to(tokens.dtype)
-        queries = queries.unsqueeze(0).expand(tokens.shape[0], -1, -1)
-        # [native CLS/register | injected scene queries | image patches].
-        tokens = torch.cat(
-            (
-                tokens[:, : self.num_prefix_tokens],
-                queries,
-                tokens[:, self.num_prefix_tokens :],
-            ),
-            dim=1,
-        )
-        tokens = backbone.norm_pre(tokens)
-        # EVA/DINOv3 applies RoPE only after ``num_prefix_tokens``.  Our scene
-        # queries are additional prefix-style tokens, so temporarily extend
-        # that boundary while retaining RoPE for every image patch.
-        attention_prefixes: list[tuple[nn.Module, int]] = []
-        for block in backbone.blocks:
-            attention = getattr(block, "attn", None)
-            if attention is not None and hasattr(attention, "num_prefix_tokens"):
-                attention_prefixes.append((attention, int(attention.num_prefix_tokens)))
-                attention.num_prefix_tokens = self.num_prefix_tokens + scene_query_count
-        try:
-            if getattr(backbone, "rope_mixed", False) and rope is not None:
-                for index, block in enumerate(backbone.blocks):
-                    tokens = block(tokens, rope=rope[index])
-            else:
-                for block in backbone.blocks:
-                    try:
-                        tokens = block(tokens, rope=rope)
-                    except TypeError:
-                        tokens = block(tokens)
-        finally:
-            for attention, prefix_count in attention_prefixes:
-                attention.num_prefix_tokens = prefix_count
-        tokens = backbone.norm(tokens)
-        cls = tokens[:, :1]
-        registers = tokens[:, 1 : self.num_prefix_tokens]
-        scene_queries = tokens[
-            :, self.num_prefix_tokens : self.num_prefix_tokens + scene_query_count
-        ]
-        # Validate the special-token contract separately from the injected
-        # queries.  This also prevents accidentally treating DINOv2 patch-only
-        # output as DINOv3.
-        patch_start = self.num_prefix_tokens + scene_query_count
-        split_dinov3_tokens(
-            torch.cat((cls, registers, tokens[:, patch_start:]), dim=1),
-            self.num_prefix_tokens,
-        )
-        return cls, registers, scene_queries
-
-    def _forward_all_native(self, images: torch.Tensor) -> torch.Tensor:
-        """Run backbone without query injection; return all native tokens (CLS+reg+patches)."""
-        backbone = self.backbone
-        tokens = backbone.patch_embed(images)
-        positional = backbone._pos_embed(tokens)
-        if isinstance(positional, tuple):
-            tokens, rope = positional
-        else:
-            tokens, rope = positional, None
-        tokens = backbone.norm_pre(tokens)
-        if getattr(backbone, "rope_mixed", False) and rope is not None:
-            for index, block in enumerate(backbone.blocks):
-                tokens = block(tokens, rope=rope[index])
-        else:
-            for block in backbone.blocks:
-                try:
-                    tokens = block(tokens, rope=rope)
-                except TypeError:
-                    tokens = block(tokens)
-        tokens = backbone.norm(tokens)
-        split_dinov3_tokens(tokens, self.num_prefix_tokens)
-        return tokens
-
-    def forward(self, images: torch.Tensor, output_tokens: int | None = None) -> torch.Tensor:
-        b, t, v, c, _, _ = images.shape
-        flat = images.reshape(b * t * v, c, images.shape[-2], images.shape[-1])
-        flat = torch.nn.functional.interpolate(flat, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
-        flat = flat.permute(0, 2, 3, 1)
-        flat = (flat - self.mean) / self.std
-        flat = flat.permute(0, 3, 1, 2).contiguous()
-        if output_tokens is None:
-            tokens = self._forward_all_native(flat)
-        else:
-            layout = self.token_layout(output_tokens)
-            cls_token, register_tokens, scene_queries = self._forward_features_with_scene_queries(
-                flat, layout["scene_queries"]
-            )
-            tokens = torch.cat((cls_token, register_tokens, scene_queries), dim=1)
-        tokens = self.output_projection(tokens)
-        tokens = tokens.reshape(b, t, v, tokens.shape[1], -1)
-        return tokens.mean(dim=2)
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 5:
+            raise ValueError(f"scene images must be [B,N,3,H,W], got {tuple(images.shape)}")
+        batch, frames = images.shape[0], images.shape[1]
+        if frames != self.num_frames:
+            raise ValueError(f"scene encoder was built for {self.num_frames} frames, got {frames}")
+        tokens = self.patch(images.reshape(batch * frames, *images.shape[2:])).flatten(2)
+        tokens = self.pool(tokens).transpose(1, 2)
+        tokens = self.neck(tokens)
+        return tokens.reshape(batch, frames * self.num_scene_tokens, -1)
 
 
 class SceneEncoder(nn.Module):
+    """DrivoR's scene features: per-frame scene queries plus one ego token.
+
+    DrivoR builds ``ego_token = hist_encoding(ego_status)[:, None]`` from a single
+    ``Linear(11, tf_d_model)`` -- one token, no attention fusion.  NVS keeps that
+    exactly and only adds a learnable per-frame embedding, because DrivoR consumes
+    one timestamp across four cameras while NVS consumes five timestamps of one
+    camera and still has to tell them apart.
+    """
+
     def __init__(
         self,
         d_model: int,
-        current_tokens: int = 32,
-        history_tokens: int = 8,
-        ego_dim: int = 8,
+        frames: int = 5,
+        views: int = 1,
+        num_scene_tokens: int = DRIVOR_NUM_SCENE_TOKENS,
         dino_checkpoint: str | None = None,
-        dino_model_name: str = "vit_large_patch16_dinov3.lvd1689m",
-        dino_image_size: int = 224,
-        dino_lora_rank: int = 16,
-        dino_lora_alpha: float = 16.0,
-        dino_lora_dropout: float = 0.0,
-        use_all_native_tokens: bool = False,
+        dino_model_name: str = DINOV3_MODEL_NAME,
+        dino_image_hw: Sequence[int] = DRIVOR_OFFICIAL_IMAGE_HW,
+        dino_lora_rank: int = DRIVOR_LORA_RANK,
+        dino_grad_checkpointing: bool = False,
     ) -> None:
         super().__init__()
-        self.current_tokens = current_tokens
-        self.history_tokens = history_tokens
-        self.use_all_native_tokens = use_all_native_tokens
+        self.frames = frames
+        self.views = views
+        self.num_scene_tokens = num_scene_tokens
+        self.frame_axis = frames * views
         self.student = (
-            TimmDinoV3Student(
+            DrivoRDinoV3Student(
                 checkpoint=dino_checkpoint,
                 model_name=dino_model_name,
-                output_dim=d_model,
-                image_size=dino_image_size,
+                image_hw=tuple(dino_image_hw),
+                num_scene_tokens=num_scene_tokens,
+                num_frames=self.frame_axis,
                 lora_rank=dino_lora_rank,
-                lora_alpha=dino_lora_alpha,
-                lora_dropout=dino_lora_dropout,
-                use_all_native_tokens=use_all_native_tokens,
+                output_dim=d_model,
+                grad_checkpointing=dino_grad_checkpointing,
             )
             if dino_checkpoint
-            else SpatialStudent(d_model)
+            else SpatialStudent(d_model, num_frames=self.frame_axis, num_scene_tokens=num_scene_tokens)
         )
-        if use_all_native_tokens and not isinstance(self.student, TimmDinoV3Student):
-            raise ValueError("use_all_native_tokens requires a real DINOv3 checkpoint")
-        self.time_embedding = nn.Parameter(torch.zeros(5, d_model))
-        self.ego_mlp = nn.Sequential(nn.Linear(ego_dim + 4, d_model), nn.GELU(), nn.Linear(d_model, d_model))
-        self.ego_query = nn.Parameter(torch.randn(2, d_model) * 0.02)
-        self.ego_attention = nn.MultiheadAttention(d_model, num_heads=8 if d_model % 8 == 0 else 1, batch_first=True)
+        self.time_embedding = nn.Parameter(torch.zeros(self.frame_axis, d_model))
+        self.hist_encoding = nn.Linear(EGO_OBSERVABLE_DIM, d_model)
+
+    @property
+    def visual_tokens(self) -> int:
+        return self.frame_axis * self.num_scene_tokens
+
+    @property
+    def scene_tokens(self) -> int:
+        return self.visual_tokens + 1
+
+    def token_layout(self) -> dict[str, object]:
+        layout = dict(self.student.token_layout())
+        layout.update(
+            {
+                "ego_tokens": 1,
+                "ego_observable_dim": EGO_OBSERVABLE_DIM,
+                "scene_tokens": self.scene_tokens,
+                "frames": self.frames,
+                "views": self.views,
+            }
+        )
+        return layout
 
     def encode_clean_ego(self, observation: Observation) -> torch.Tensor:
-        """Encode DrivoR-ordered current ego state and route command once.
+        """DrivoR's ``ego_status``: ``pose3, velocity2, acceleration2, command4``."""
 
-        The observable vector is ``pose3, velocity2, acceleration2, command4``.
-        A trailing zero keeps the existing 12-wide NVS checkpoint interface.
-        """
         observation.validate()
         current = observation.ego_history[:, -1]
-        ego_features = torch.cat((current[:, :7], observation.route_command, current[:, 7:]), dim=-1)
-        return self.ego_mlp(ego_features)
+        ego_status = torch.cat((current, observation.route_command), dim=-1)
+        if ego_status.shape[-1] != EGO_OBSERVABLE_DIM:
+            raise ValueError(f"ego observable must be {EGO_OBSERVABLE_DIM}-wide")
+        return self.hist_encoding(ego_status)
 
-    def forward(
-        self,
-        observation: Observation,
-        clean_ego: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, observation: Observation, clean_ego: torch.Tensor | None = None) -> torch.Tensor:
         observation.validate()
-        if self.use_all_native_tokens:
-            all_frames = self.student(observation.rgb_history)
-            all_frames = all_frames + self.time_embedding.view(1, 5, 1, -1)
-            visual = all_frames.flatten(1, 2)
-        else:
-            visual_current = self.student(observation.rgb_history[:, -1:], self.current_tokens)[:, 0]
-            visual_history = self.student(observation.rgb_history[:, :-1], self.history_tokens)
-            visual_history = visual_history + self.time_embedding[:-1].view(1, 4, 1, -1)
-            visual_current = visual_current + self.time_embedding[-1].view(1, 1, -1)
-            visual = torch.cat((visual_current, visual_history.flatten(1, 2)), dim=1)
+        batch, frames, views = observation.rgb_history.shape[:3]
+        if (frames, views) != (self.frames, self.views):
+            raise ValueError(f"observation must carry {self.frames}x{self.views} frames, got {frames}x{views}")
+        images = observation.rgb_history.reshape(batch, frames * views, *observation.rgb_history.shape[3:])
+        # Frame-major, matching the student's `(b n) t c -> b (n t) c` output: each
+        # frame's embedding is shared by its `num_scene_tokens` queries.
+        time_embedding = self.time_embedding.unsqueeze(0).repeat_interleave(self.num_scene_tokens, dim=1)
+        visual = self.student(images) + time_embedding
         if clean_ego is None:
             clean_ego = self.encode_clean_ego(observation)
-        if clean_ego.ndim != 2 or clean_ego.shape != (visual.shape[0], visual.shape[-1]):
+        if clean_ego.shape != (batch, self.hist_encoding.out_features):
             raise ValueError("clean ego encoding must be [B,d_model]")
-        queries = self.ego_query.unsqueeze(0).expand(visual.shape[0], -1, -1) + clean_ego.unsqueeze(1)
-        fused, _ = self.ego_attention(queries, visual, visual)
-        return torch.cat((visual, fused), dim=1)
+        return torch.cat((visual, clean_ego.unsqueeze(1)), dim=1)
 
 
 class FeedForward(nn.Module):
@@ -387,314 +265,226 @@ class RegisterBlock(nn.Module):
         return register.reshape(b, m, nr, d)
 
 
-class WanRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        normalized = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return normalized.to(dtype) * self.weight
-
-
-def wan_modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x * (1 + scale) + shift
-
-
-def build_rope_tables(head_dim: int, max_seq: int, theta: float = 10000.0) -> tuple[torch.Tensor, torch.Tensor]:
-    if head_dim % 2:
-        raise ValueError("Wan RoPE requires an even head dim")
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-    angles = torch.outer(torch.arange(max_seq, dtype=torch.float32), inv_freq)
-    return angles.cos(), angles.sin()
-
-
-class WanSelfAttention(nn.Module):
-    """Wan2.2-style self-attention: per-head QK RMSNorm + 1D RoPE over the
-    action-token time axis, then SDPA.  Runs per candidate on [B*M, na, d]."""
-
-    def __init__(self, hidden_dim: int, num_heads: int, rope_positions: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        if hidden_dim % num_heads:
-            raise ValueError("hidden_dim must be divisible by num_heads")
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        if self.head_dim % 2:
-            raise ValueError("head dim must be even for RoPE")
-        self.q = nn.Linear(hidden_dim, hidden_dim)
-        self.k = nn.Linear(hidden_dim, hidden_dim)
-        self.v = nn.Linear(hidden_dim, hidden_dim)
-        self.o = nn.Linear(hidden_dim, hidden_dim)
-        self.norm_q = WanRMSNorm(self.head_dim, eps=eps)
-        self.norm_k = WanRMSNorm(self.head_dim, eps=eps)
-        rope_cos, rope_sin = build_rope_tables(self.head_dim, rope_positions)
-        self.register_buffer("rope_cos", rope_cos, persistent=False)
-        self.register_buffer("rope_sin", rope_sin, persistent=False)
-
-    def _apply_rope(self, x: torch.Tensor) -> torch.Tensor:
-        # x is [B,S,H,head_dim]; tables are [S,1,head_dim/2] to broadcast over heads.
-        cos = self.rope_cos[: x.shape[1]].unsqueeze(1).to(x.dtype)
-        sin = self.rope_sin[: x.shape[1]].unsqueeze(1).to(x.dtype)
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-        return torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).flatten(-2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, s, _ = x.shape
-        if s > self.rope_cos.shape[0]:
-            raise ValueError("sequence longer than precomputed RoPE table")
-        q = self.norm_q(self.q(x).view(b, s, self.num_heads, self.head_dim))
-        k = self.norm_k(self.k(x).view(b, s, self.num_heads, self.head_dim))
-        v = self.v(x).view(b, s, self.num_heads, self.head_dim)
-        q = self._apply_rope(q).transpose(1, 2)
-        k = self._apply_rope(k).transpose(1, 2)
-        v = v.transpose(1, 2)
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        return self.o(out.transpose(1, 2).reshape(b, s, -1))
-
-
-class WanCrossAttention(nn.Module):
-    """Wan2.2-style cross-attention (no RoPE): Action queries read the directed
-    context ``[Scene | stopgrad(Register)]``."""
-
-    def __init__(self, hidden_dim: int, num_heads: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        if hidden_dim % num_heads:
-            raise ValueError("hidden_dim must be divisible by num_heads")
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.q = nn.Linear(hidden_dim, hidden_dim)
-        self.k = nn.Linear(hidden_dim, hidden_dim)
-        self.v = nn.Linear(hidden_dim, hidden_dim)
-        self.o = nn.Linear(hidden_dim, hidden_dim)
-        self.norm_q = WanRMSNorm(self.head_dim, eps=eps)
-        self.norm_k = WanRMSNorm(self.head_dim, eps=eps)
-
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        b, s, _ = x.shape
-        length = context.shape[1]
-        q = self.norm_q(self.q(x).view(b, s, self.num_heads, self.head_dim)).transpose(1, 2)
-        k = self.norm_k(self.k(context).view(b, length, self.num_heads, self.head_dim)).transpose(1, 2)
-        v = self.v(context).view(b, length, self.num_heads, self.head_dim).transpose(1, 2)
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        return self.o(out.transpose(1, 2).reshape(b, s, -1))
-
-
-class WanActionBlock(nn.Module):
-    """Wan2.2 ``DiTBlock`` adapted to the directed NVS Action reads.
-
-    Per candidate m: self-attn keeps ``A<-A``; cross-attn reads
-    ``[S | sg(R)]``; together they preserve ``A<-[S,A,sg(R)]`` in Wan's
-    self+cross form instead of one shared softmax.  ``t_mod`` carries the
-    adaLN conditioning (mode code + projected clean ego) in place of Wan's
-    diffusion timestep; NVS runs a single forward with no sampling loops.
-    """
-
-    def __init__(self, d_model: int, heads: int, ffn_dim: int, action_tokens: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.self_attn = WanSelfAttention(d_model, heads, rope_positions=action_tokens, eps=eps)
-        self.cross_attn = WanCrossAttention(d_model, heads, eps=eps)
-        self.norm1 = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(d_model, eps=eps)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, d_model)
-        )
-        self.modulation = nn.Parameter(torch.randn(1, 6, d_model) / d_model**0.5)
-
-    def forward(
-        self,
-        action: torch.Tensor,
-        scene: torch.Tensor,
-        register_memory: torch.Tensor,
-        t_mod: torch.Tensor,
-    ) -> torch.Tensor:
-        b, m, na, d = action.shape
-        ns = scene.shape[1]
-        action = action.reshape(b * m, na, d)
-        scene = scene.unsqueeze(1).expand(b, m, ns, d).reshape(b * m, ns, d)
-        context = torch.cat((scene, register_memory.reshape(b * m, register_memory.shape[2], d)), dim=1)
-        if t_mod.shape != (b * m, 6, d):
-            raise ValueError("t_mod must be [B*M,6,d]")
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation + t_mod).chunk(6, dim=1)
-        action = action + gate_msa * self.self_attn(wan_modulate(self.norm1(action), shift_msa, scale_msa))
-        action = action + self.cross_attn(self.norm3(action), context)
-        action = action + gate_mlp * self.ffn(wan_modulate(self.norm2(action), shift_mlp, scale_mlp))
-        return action.reshape(b, m, na, d)
-
-
-class WanActionHead(nn.Module):
-    """Wan2.2 ``Head`` for the single-step residual endpoint readout."""
-
-    def __init__(self, d_model: int, out_dim: int = 4, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
-        self.head = nn.Linear(d_model, out_dim)
-        self.modulation = nn.Parameter(torch.randn(1, 2, d_model) / d_model**0.5)
-
-    def forward(self, action: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        b, m, na, d = action.shape
-        action = action.reshape(b * m, na, d)
-        t = cond.reshape(b * m, d).unsqueeze(1)
-        shift, scale = (self.modulation + t).chunk(2, dim=1)
-        return self.head(self.norm(action) * (1 + scale) + shift).reshape(b, m, na, -1)
-
-
 class DirectedPairDiT(nn.Module):
     def __init__(
         self,
         d_model: int = 256,
-        heads: int = 8,
+        heads: int = 4,
         ffn_dim: int = 1024,
         depth: int = 8,
         action_tokens: int = 8,
         register_tokens: int = 4,
-        scene_tokens: int = 66,
-        xy_scale: float = 20.0,
+        frames: int = 5,
+        views: int = 1,
+        num_scene_tokens: int = DRIVOR_NUM_SCENE_TOKENS,
         dino_checkpoint: str | None = None,
-        dino_model_name: str = "vit_large_patch16_dinov3.lvd1689m",
-        dino_image_size: int = 224,
-        dino_lora_rank: int = 16,
-        dino_lora_alpha: float = 16.0,
-        dino_lora_dropout: float = 0.0,
-        ego_dim: int = 8,
-        use_all_native_tokens: bool = False,
+        dino_model_name: str = DINOV3_MODEL_NAME,
+        dino_image_hw: Sequence[int] = DRIVOR_OFFICIAL_IMAGE_HW,
+        dino_lora_rank: int = DRIVOR_LORA_RANK,
+        dino_grad_checkpointing: bool = False,
+        wan_backbone_path: str | None = None,
+        attn_head_dim: int = 64,
+        freq_dim: int = 256,
+        eps: float = 1e-6,
     ) -> None:
         super().__init__()
         if d_model % heads:
             raise ValueError("d_model must be divisible by heads")
+        if freq_dim != d_model:
+            raise ValueError("the Wan time_embedding input is the NVS condition vector at d_model")
         self.d_model = d_model
         self.action_tokens = action_tokens
         self.register_tokens = register_tokens
-        self.xy_scale = xy_scale
-        self.use_all_native_tokens = use_all_native_tokens
-        if use_all_native_tokens:
-            scene_tokens = 5 * 201 + 2
-        self.scene_tokens = scene_tokens
+        self.depth = depth
         self.eta = SceneEncoder(
             d_model,
-            ego_dim=ego_dim,
+            frames=frames,
+            views=views,
+            num_scene_tokens=num_scene_tokens,
             dino_checkpoint=dino_checkpoint,
             dino_model_name=dino_model_name,
-            dino_image_size=dino_image_size,
+            dino_image_hw=dino_image_hw,
             dino_lora_rank=dino_lora_rank,
-            dino_lora_alpha=dino_lora_alpha,
-            dino_lora_dropout=dino_lora_dropout,
-            use_all_native_tokens=use_all_native_tokens,
+            dino_grad_checkpointing=dino_grad_checkpointing,
         )
+        self.scene_tokens = self.eta.scene_tokens
         self.phi = nn.ModuleDict(
             {
                 "mode_projection": nn.Linear(2, d_model),
+                # The metric trajectory is what makes one candidate's future
+                # differ from another's inside the same scene: 8 poses x [x,y,heading].
+                "trajectory_projection": nn.Linear(action_tokens * TRAJECTORY_STATE_DIM, d_model),
                 "blocks": nn.ModuleList([RegisterBlock(d_model, heads, ffn_dim) for _ in range(depth)]),
             }
         )
         self.phi_time_queries = nn.Parameter(torch.randn(register_tokens, d_model) * 0.02)
-        self.theta = nn.ModuleDict(
-            {
-                "source_projection": nn.Linear(4, d_model),
-                "mode_projection": nn.Linear(2, d_model),
-                # Action owns this projection, while eta.ego_mlp is the shared
-                # clean observable encoder also used by Scene conditioning.
-                "ego_to_action_projection": nn.Linear(d_model, d_model),
-                # Wan time_projection analogue: mode + projected clean ego play
-                # the role of Wan's diffusion timestep (NVS has no flow time).
-                "cond_projection": nn.Sequential(nn.SiLU(), nn.Linear(d_model, d_model * 6)),
-                "blocks": nn.ModuleList(
-                    [WanActionBlock(d_model, heads, ffn_dim, action_tokens) for _ in range(depth)]
-                ),
-                "trajectory_head": WanActionHead(d_model),
-            }
+        # The trajectory arrives in metres, so its coordinates reach ~60 while the
+        # compressed targets sit near 1.  A default-initialised projection therefore
+        # starts the register ~5x larger than anything it has to predict, and the
+        # first steps only undo that.  Zeroing it makes the trajectory a residual the
+        # branch grows into, which leaves the anchor-only initialisation exactly as
+        # it was and still passes gradient: the input is non-zero, so both weight and
+        # bias receive one from step 0.
+        nn.init.zeros_(self.phi["trajectory_projection"].weight)
+        nn.init.zeros_(self.phi["trajectory_projection"].bias)
+        self.theta = NvsActionDiT(
+            hidden_dim=d_model,
+            action_dim=TRAJECTORY_STATE_DIM,
+            ffn_dim=ffn_dim,
+            text_dim=d_model,
+            freq_dim=freq_dim,
+            eps=eps,
+            num_heads=heads,
+            attn_head_dim=attn_head_dim,
+            num_layers=depth,
+            action_tokens=action_tokens,
+            mode_dim=2,
+            ego_dim=d_model,
         )
-        self.theta_time_embedding = nn.Parameter(torch.randn(action_tokens, d_model) * 0.02)
+        self.wan_backbone_path = None
+        self.wan_backbone_info: dict[str, object] = {"loaded": False}
+        if wan_backbone_path:
+            self.wan_backbone_info = load_action_dit_backbone(self.theta, wan_backbone_path)
+            self.wan_backbone_info["loaded"] = True
+            self.wan_backbone_path = str(wan_backbone_path)
         self.scene_blocks = nn.ModuleList([SceneBlock(d_model, heads, ffn_dim) for _ in range(depth)])
         self.register_readout = nn.Identity()
-        self.register_tokens = register_tokens
-        self.depth = depth
-        self.register_parameter("_unused_scene_token_anchor", nn.Parameter(torch.zeros(scene_tokens, d_model), requires_grad=False))
+        # Stateless schedule, not an nn.Module on purpose: it must contribute no
+        # Parameter that parameter_groups()/the Wan payload key check would see.
+        self.flow = ActionFlow()
 
-    def _initialize_register(self, modes: torch.Tensor) -> torch.Tensor:
-        b, m, _ = modes.shape
+    def token_layout(self) -> dict[str, object]:
+        return self.eta.token_layout()
+
+    def _initialize_register(self, modes: torch.Tensor | None, source: torch.Tensor) -> torch.Tensor:
+        """``R0 = time_queries + projected_trajectory [+ projected_mode_code]``.
+
+        ``modes=None`` drops the mode term.  Stage 1 trains one register per GT
+        trajectory, so a mode code that is constant per row index would let the
+        network answer "which GT is this" from the row alone and never read the
+        trajectory -- the exact failure the anchor-only Stage 1 had.
+        """
+
+        if source.ndim != 4 or source.shape[-2:] != (self.action_tokens, TRAJECTORY_STATE_DIM):
+            raise ValueError(f"source must be [B,M,{self.action_tokens},{TRAJECTORY_STATE_DIM}] in metres")
+        b, m = source.shape[0], source.shape[1]
+        if modes is not None and modes.shape[:2] != (b, m):
+            raise ValueError("modes must align with source on [B,M]")
         query = self.phi_time_queries.view(1, 1, self.register_tokens, self.d_model)
-        mode = self.phi["mode_projection"](modes).unsqueeze(2)
-        return query.expand(b, m, -1, -1) + mode
-
-    def _initialize_action(
-        self,
-        source: torch.Tensor,
-        modes: torch.Tensor,
-        clean_ego: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build Ego-conditioned A0 by same-width feature addition.
-
-        ``source`` remains the only noisy input.  ``clean_ego`` is eta's clean
-        observable encoding, never raw state added to trajectory coordinates.
-        """
-        if source.ndim != 4 or source.shape[-1] != 4:
-            raise ValueError("source must be [B,M,action_tokens,4]")
-        if modes.ndim != 3 or modes.shape[-1] != 2 or source.shape[:2] != modes.shape[:2]:
-            raise ValueError("modes must be [B,M,2] and align with source")
-        if source.shape[2] != self.action_tokens:
-            raise ValueError(f"source action axis must contain {self.action_tokens} tokens")
-        if clean_ego.ndim == 3:
-            clean_ego = clean_ego.mean(dim=1)
-        if clean_ego.ndim != 2 or clean_ego.shape != (source.shape[0], self.d_model):
-            raise ValueError("clean ego encoding must be [B,d_model] or [B,L,d_model]")
-        action = self.theta["source_projection"](source)
-        mode = self.theta["mode_projection"](modes).unsqueeze(2)
-        time = self.theta_time_embedding.view(1, 1, self.action_tokens, self.d_model)
-        ego = self.theta["ego_to_action_projection"](clean_ego).view(source.shape[0], 1, 1, self.d_model)
-        return action + ego + time + mode
-
-    def _action_conditioning(self, modes: torch.Tensor, clean_ego: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build the Wan adaLN condition from mode code + projected clean ego.
-
-        ``cond`` [B,M,d] feeds the modulated Head; ``t_mod`` [B*M,6,d] feeds
-        every block's six-parameter shift/scale/gate modulation, replacing
-        Wan's timestep embedding.  Both reuse theta-owned projections that also
-        form A0, so conditioning enters by feature addition only.
-        """
-        if clean_ego.ndim == 3:
-            clean_ego = clean_ego.mean(dim=1)
-        cond = self.theta["mode_projection"](modes) + self.theta["ego_to_action_projection"](clean_ego).unsqueeze(1)
-        b, m, d = cond.shape
-        t_mod = self.theta["cond_projection"](cond).view(b * m, 6, d)
-        return cond, t_mod
+        register = query.expand(b, m, -1, -1) + self.phi["trajectory_projection"](source.flatten(-2)).unsqueeze(2)
+        if modes is not None:
+            register = register + self.phi["mode_projection"](modes).unsqueeze(2)
+        return register
 
     def _directed_pass(
         self,
         scene: torch.Tensor,
         action: torch.Tensor | None,
         register: torch.Tensor,
-        t_mod: torch.Tensor | None = None,
+        condition: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        for scene_block, register_block, action_block in zip(self.scene_blocks, self.phi["blocks"], self.theta["blocks"]):
+        b, m, nr, d = register.shape
+        ns = scene.shape[1]
+        raw_contexts: list[torch.Tensor] = []
+        for scene_block, register_block in zip(self.scene_blocks, self.phi["blocks"]):
             scene = scene_block(scene)
             register = register_block(register, scene)
             if action is not None:
-                action = action_block(action, scene, self.register_readout(register).detach(), t_mod)
-        return scene, register, action
+                scene_flat = scene.unsqueeze(1).expand(b, m, ns, d).reshape(b * m, ns, d)
+                register_flat = self.register_readout(register).detach().reshape(b * m, nr, d)
+                raw_contexts.append(torch.cat((scene_flat, register_flat), dim=1))
+        if action is None:
+            return scene, register, None
+        # Wan embeds the cross-attention context once in `pre_dit`; NVS's Action
+        # stream reads the Register at every layer, so each layer gets its own.
+        contexts = [self.theta.text_embedding(context) for context in raw_contexts]
+        flat_condition = condition.reshape(b * m, d)
+        velocity = self.theta(action.reshape(b * m, self.action_tokens, d), flat_condition, contexts)
+        return scene, register, velocity.reshape(b, m, self.action_tokens, -1)
 
-    def forward_register_only(self, observation: Observation, modes: torch.Tensor) -> torch.Tensor:
+    def forward_register_only(self, observation: Observation, source: torch.Tensor, modes: torch.Tensor | None = None) -> torch.Tensor:
         clean_ego = self.eta.encode_clean_ego(observation)
         scene = self.eta(observation, clean_ego=clean_ego)
-        register = self._initialize_register(modes)
+        register = self._initialize_register(modes, source)
         _, register, _ = self._directed_pass(scene, None, register)
         return self.register_readout(register)
 
-    def forward_pairs(self, observation: Observation, source: torch.Tensor, modes: torch.Tensor) -> PairOutputs:
+    def _flow_pass(
+        self,
+        observation: Observation,
+        noisy_action: torch.Tensor,
+        modes: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shared trunk: encode ``x_sigma`` and return ``(scene, register, velocity)``."""
         clean_ego = self.eta.encode_clean_ego(observation)
         scene = self.eta(observation, clean_ego=clean_ego)
-        action = self._initialize_action(source, modes, clean_ego)
-        cond, t_mod = self._action_conditioning(modes, clean_ego)
-        register = self._initialize_register(modes)
-        scene, register, action = self._directed_pass(scene, action, register, t_mod)
-        endpoint = source + self.theta["trajectory_head"](action, cond)
-        source_yaw = torch.atan2(source[..., 2], source[..., 3])
-        trajectory = decode_trajectory(endpoint, self.xy_scale, source_yaw=source_yaw)
-        return PairOutputs(scene, endpoint, trajectory, self.register_readout(register))
+        action = self.theta.encode_action(noisy_action, modes, clean_ego)
+        condition = self.theta.encode_condition(modes, clean_ego, timestep)
+        # The Register is conditioned on the same flow state the Action stream
+        # sees, so Stage 1 (sigma=0) reads the clean GT trajectory and Stage 2
+        # reads the noised one -- never a clean answer the DiT has to rediscover.
+        register = self._initialize_register(modes, noisy_action)
+        scene, register, velocity = self._directed_pass(scene, action, register, condition)
+        return scene, self.register_readout(register), velocity
+
+    def forward_pairs(self, observation: Observation, source: torch.Tensor, modes: torch.Tensor) -> PairOutputs:
+        """Deployed inference: one forward at ``sigma = 1``, no rollout.
+
+        ``source`` is the clean anchor grid, which at ``sigma = 1`` *is* the flow
+        state, so this path never needs a GT trajectory.  With the near-zero
+        ``Head`` initialization the recovered endpoint equals ``source``, i.e. the
+        anchor grid's own oracle-best PDMS is the starting point of training.
+        """
+        self._check_source(source)
+        timestep = torch.full(
+            (source.shape[0],),
+            INFERENCE_SIGMA * self.flow.num_train_timesteps,
+            device=source.device,
+            dtype=source.dtype,
+        )
+        scene, register, velocity = self._flow_pass(observation, source, modes, timestep)
+        endpoint = self.flow.recover(source, velocity, timestep)
+        return PairOutputs(scene, endpoint, endpoint, register)
+
+    def forward_flow(
+        self,
+        observation: Observation,
+        source: torch.Tensor,
+        modes: torch.Tensor,
+        data: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> FlowOutputs:
+        """Training forward at a sampled ``timestep``: noise the action, denoise once.
+
+        ``source`` is the anchor prior (the flow's ``sigma = 1`` endpoint) and
+        ``data`` is the per-candidate target trajectory (its ``sigma = 0``
+        endpoint).  The two are interpolated by :class:`ActionFlow`, the DiT
+        predicts the velocity, and the trajectory is recovered algebraically in the
+        same forward -- so training never rolls out ``step1 -> step2 -> ...``.
+        """
+        self._check_source(source)
+        if data.shape != source.shape:
+            raise ValueError(f"flow data must be {tuple(source.shape)}, got {tuple(data.shape)}")
+        if tuple(timestep.shape) != (source.shape[0],):
+            raise ValueError(f"timestep must be [B], got {tuple(timestep.shape)}")
+        noisy_action, velocity_target = self.flow.noisy_action(source, data, timestep)
+        scene, register, velocity = self._flow_pass(observation, noisy_action, modes, timestep)
+        endpoint = self.flow.recover(noisy_action, velocity, timestep)
+        return FlowOutputs(
+            PairOutputs(scene, endpoint, endpoint, register),
+            noisy_action,
+            velocity,
+            velocity_target,
+            timestep,
+        )
+
+    def _check_source(self, source: torch.Tensor) -> None:
+        if source.ndim != 4 or source.shape[-1] != TRAJECTORY_STATE_DIM:
+            raise ValueError(f"source must be [B,M,{self.action_tokens},{TRAJECTORY_STATE_DIM}] in metres")
+
+    def named_trainable_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
+        return ((name, p) for name, p in self.named_parameters() if p.requires_grad)
 
 
 def parameter_groups(model: DirectedPairDiT) -> dict[str, list[nn.Parameter]]:
@@ -704,8 +494,28 @@ def parameter_groups(model: DirectedPairDiT) -> dict[str, list[nn.Parameter]]:
             continue
         if name.startswith("eta.") or name.startswith("scene_blocks."):
             groups["eta"].append(parameter)
-        elif name.startswith("theta.") or name == "theta_time_embedding":
+        elif name.startswith("theta."):
             groups["theta"].append(parameter)
         elif name.startswith("phi.") or name == "phi_time_queries":
             groups["phi"].append(parameter)
+        else:
+            raise ValueError(f"parameter `{name}` is not assigned to an eta/theta/phi group")
     return groups
+
+
+__all__ = [
+    "EGO_OBSERVABLE_DIM",
+    "EGO_STATUS_DIM",
+    "GROUP_ALLOW",
+    "TRAJECTORY_STATE_DIM",
+    "DirectedPairDiT",
+    "FlowOutputs",
+    "PairOutputs",
+    "RegisterBlock",
+    "SceneBlock",
+    "SceneEncoder",
+    "SpatialStudent",
+    "build_group_mask",
+    "freeze_backbone_keep_lora",
+    "parameter_groups",
+]

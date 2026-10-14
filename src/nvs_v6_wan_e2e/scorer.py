@@ -54,8 +54,8 @@ class ScratchDrivoRScorer(nn.Module):
     cross-attention are the official ``TransformerDecoderScorer``.  Cross K/V
     is the ``DirectedPairDiT.forward_pairs().scene_context`` read end-to-end:
     exactly like DrivoR it is NOT detached, so the score loss also shapes the
-    Scene representation (eta), while proposals stay detached.  The mean of the
-    final two ego-fused tokens is added before the six official heads.
+    Scene representation (eta), while proposals stay detached.  DrivoR's single
+    ego token -- the last Scene slot -- is added before the six official heads.
     Future Register is intentionally not a scorer input under the v6 contract.
     """
 
@@ -71,15 +71,14 @@ class ScratchDrivoRScorer(nn.Module):
         heads: int = 1,
         ffn_dim: int = 1024,
         decoder_layers: int = 4,
-        scene_tokens: int = 66,
+        scene_tokens: int = 81,
         future_layers: int | None = None,
     ) -> None:
         super().__init__()
         del future_layers  # compatibility only; Future Register is not consumed
-        # Expected NVS Scene K/V length.  66 is the compressed-query layout;
-        # 1007 is the all-native layout (5x201 DINOv3 tokens + 2 ego-fused).
-        # The scorer is length-agnostic except that the final two tokens are
-        # the ego-fused pair pooled into ``ego_token``.
+        # Expected NVS Scene K/V length: 5 frames x 16 DrivoR scene queries + 1
+        # ego token.  The scorer is length-agnostic except that the final token
+        # is DrivoR's single ego token, pooled into ``ego_token``.
         self.scene_tokens = scene_tokens
         try:
             from navsim.agents.drivoR.layers.losses.drivor_loss import DrivoRLoss
@@ -113,7 +112,7 @@ class ScratchDrivoRScorer(nn.Module):
             "native_dinov2_scene_cache": False,
             "native_ego_cache": False,
             "scene_kv_detached": False,
-            "ego_pool": "mean(scene_context[:, -2:, :])",
+            "ego_pool": "scene_context[:, -1:, :]",
             "predicted_register_input": False,
         }
 
@@ -145,7 +144,8 @@ class ScratchDrivoRScorer(nn.Module):
         scene_kv = scene
         proposals = trajectory.detach()
         embedded = self.trajectory_projection(proposals.reshape(batch, candidates, 8 * 3))
-        ego_token = scene_kv[:, -2:].mean(dim=1, keepdim=True)
+        # DrivoR emits exactly one ego token, so it is the last Scene slot.
+        ego_token = scene_kv[:, -1:]
         score_features = self.scorer_attention(embedded, scene_kv) + ego_token
         pred_logit, *_ = self.scorer(proposals, score_features)
         return torch.stack([pred_logit[name] for name in HEAD_NAMES], dim=-1)

@@ -1,28 +1,58 @@
-"""NAVSIM v6-wan-e2e: Multi-GT / Future Register generator whose Action DiT
-blocks follow the Wan2.2 DiTBlock design (randomly initialized).  Directed S/A/R
-reads and the one-pass residual-velocity endpoint output are unchanged from v6.
+"""NAVSIM v6-wan-e2e: DrivoR scene perception + Wan2.2 Action DiT generator.
 
-This is the DrivoR-exact end-to-end scorer variant of ``nvs_v6_wan``: the Scene
-K/V fed to ``ScratchDrivoRScorer`` is NOT detached, so the PDM score loss also
-shapes the Scene representation (eta), exactly like DrivoR.  Proposals stay
-detached; no register is fed; token counts, model, selection and optimizer are
-identical to ``nvs_v6_wan``."""
+The Scene stream is DrivoR's exact recipe on DINOv3: ``num_scene_tokens``
+learnable queries are prepended to every frame's patch tokens, the backbone
+keeps its native RoPE position encoding (no interpolation), and only q/v LoRA
+adapters are trainable.  The Action stream is SimWAM's Wan2.2 ``ActionDiT`` at
+``hidden_dim=256``, initialized from the released Wan2.2-TI2V-5B weights with
+SimWAM's own last-dimension interpolation.  Trajectories stay DrivoR-native
+metric ``[x, y, heading]`` -- nothing is rescaled.
 
-from .data import Observation, PairTargets, decode_trajectory, encode_trajectory
-from .model import GROUP_ALLOW, DirectedPairDiT, PairOutputs, build_group_mask
+This remains the DrivoR-exact end-to-end scorer variant: the Scene K/V fed to
+``ScratchDrivoRScorer`` is NOT detached, so the PDM score loss also shapes the
+Scene representation (eta), exactly like DrivoR."""
+
+from .data import Observation, PairTargets, drivor_observable_ego_feature, drivor_route_command
+from .model import (
+    EGO_OBSERVABLE_DIM,
+    GROUP_ALLOW,
+    TRAJECTORY_STATE_DIM,
+    DirectedPairDiT,
+    PairOutputs,
+    build_group_mask,
+    parameter_groups,
+)
 from .modes import ImmutableModeBuffer, StructuredSourceInitializer
-from .scorer import PairedFutureScorer
+from .scorer import PairedFutureScorer, ScratchDrivoRScorer
+from .vision import (
+    DRIVOR_IMAGE_HW,
+    DRIVOR_LORA_RANK,
+    DRIVOR_NUM_SCENE_TOKENS,
+    DRIVOR_OFFICIAL_IMAGE_HW,
+    DrivoRDinoV3Student,
+)
+from .wan_dit import NvsActionDiT
 
 __all__ = [
+    "DRIVOR_IMAGE_HW",
+    "DRIVOR_LORA_RANK",
+    "DRIVOR_NUM_SCENE_TOKENS",
+    "DRIVOR_OFFICIAL_IMAGE_HW",
+    "EGO_OBSERVABLE_DIM",
     "GROUP_ALLOW",
+    "TRAJECTORY_STATE_DIM",
     "DirectedPairDiT",
+    "DrivoRDinoV3Student",
     "ImmutableModeBuffer",
+    "NvsActionDiT",
     "Observation",
     "PairOutputs",
     "PairTargets",
     "PairedFutureScorer",
+    "ScratchDrivoRScorer",
     "StructuredSourceInitializer",
     "build_group_mask",
-    "decode_trajectory",
-    "encode_trajectory",
+    "drivor_observable_ego_feature",
+    "drivor_route_command",
+    "parameter_groups",
 ]

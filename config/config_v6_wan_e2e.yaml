@@ -1,0 +1,291 @@
+spec_version: '6.0'
+spec_id: navsim_future_register_R_to_A_v6
+benchmark:
+  name: navsim_v1
+  navsim_commit: fc6e5aa144bbcb5a046e22c18f1bd5cf3af8634a
+  oracle_source_commit: fc6e5aa144bbcb5a046e22c18f1bd5cf3af8634a
+  metric_cache_root: /mnt/zhaozc_workspace/project/DrivoR_multigt_kvcache_final_20261004/data_runtime/train_metric_cache
+  metric_cache_index: null
+  train_split_manifest: null
+  validation_split_manifest: null
+  test_split_manifest: null
+observation:
+  cameras: [front]
+  times_s: [-2.0, -1.5, -1.0, -0.5, 0.0]
+  history_frames: 4
+  history_valid_mask: true
+  ego_time_limit_s: 0.0
+future_target:
+  source: generated_multiview_future_mp4
+  camera: front
+  times_s: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+  chunks: [[0.5, 1.0], [1.5, 2.0], [2.5, 3.0], [3.5, 4.0]]
+  registers_per_chunk: 1
+  registers_per_gt: 4
+  max_unique_gt: 4
+  teacher: fixed_frozen_dinov3
+  teacher_checkpoint: /mnt/LLM_weight/timm/vit_large_patch16_dinov3.lvd1689m/model.safetensors
+  # The Teacher encodes the future videos at the resolution they were generated
+  # in.  464x832 is a whole number of patch16 tiles (29x52), so nothing is
+  # resampled in either direction and every target patch summarises pixels the
+  # generator actually rendered.  Its grid is coarser than the Student's 42x72 and
+  # that is deliberate: DINOv3's RoPE divides coordinates by H and W separately
+  # (make_coords_dinov3, normalize_coords='separate') and maps them to [-1, 1], so
+  # a token's position depends on where it sits in the frame, not on how many
+  # tokens the frame was cut into.  The ordered-2x2 quadrants are fractions of the
+  # frame for the same reason.  Upscaling 464x832 to the Student's size instead
+  # would invent ~1.4x more pixels than exist.
+  teacher_image_hw: [464, 832]
+  teacher_grid_hw: [29, 52]
+  teacher_resize_filter: none_native_resolution_no_interpolation
+  teacher_shares_student_checkpoint: true
+  rope_normalizes_coords_per_axis: true
+  teacher_quadrant_split: integer_division_allows_odd_grid
+  target_dim: 256
+  compression: ordered_2x2_spatial_pool_then_train_only_frozen_pca
+  compressor_rank_note: rank is min(target_dim, fit_rows); widen the fitted scene set for a full-rank target
+  target_cache_root: null
+  online_nvs: false
+  teacher_targets_as_model_inputs: false
+vision:
+  backbone: timm/vit_large_patch16_dinov3.lvd1689m
+  checkpoint: /mnt/LLM_weight/timm/vit_large_patch16_dinov3.lvd1689m/model.safetensors
+  base_trainable: false
+  frozen_base_kept_in_eval: true
+  # DrivoR's official image_size is [1148, 672] (W, H), chosen for patch14 DINOv2
+  # where 1148 = 14*82 exactly.  DINOv3 is patch16 and timm's PatchEmbed rejects
+  # that width ("Input width (1148) should be divisible by patch size (16)"), so
+  # DrivoR's resized pixels are kept byte-for-byte and the 12 px remainder is
+  # closed with four ZERO columns after normalization.  F.pad synthesizes no pixel
+  # value, which is the difference from resampling the width up to 1152.
+  drivor_image_hw: [672, 1148]
+  right_zero_pad_px: 4
+  bottom_zero_pad_px: 0
+  image_hw: [672, 1152]
+  patch_size: [16, 16]
+  patch_grid: [42, 72]
+  image_patches: 3024
+  history_resize: pil_bicubic_downscale_from_1920x1080_as_drivor
+  student_resampling: forbidden_zero_pad_only
+  native_prefix_tokens: 5
+  num_scene_tokens: 16
+  frames: 5
+  views: 1
+  visual_tokens: 80
+  ego_tokens: 1
+  scene_tokens: 81
+  position_encoding: dinov3_rope_analytic_no_interpolation
+  rope_prefix_tokens: 21
+  student_lora:
+    enabled: true
+    rank: 32
+    qv_only: true
+    a_initialization: kaiming_uniform_a_sqrt5
+    b_initialization: zeros
+    wrapped_module: attn.qkv
+  scene_query_patch: prepend_after_native_prefix_before_image_patches
+  scene_query_participates_in_backbone_qkv: true
+  whole_student_no_grad: false
+  permanent_student_feature_cache: false
+modes:
+  count: 64
+  grid: [8, 8]
+  initializer: audited_existing_8x8_or_v6_fallback
+  shared_code: immutable_exogenous_2d_U
+  shared_trainable_mode_embedding: false
+  codebook_is_buffer: true
+  codebook_hash: null
+  source_uses_gt: false
+  action_jitter_std_normalized: 0.0
+  eval_jitter_std_normalized: 0.0
+  eval_seed: 17
+model:
+  d_model: 256
+  heads: 4
+  ffn_dim: 1024
+  depth: 8
+  action_tokens: 8
+  register_tokens: 4
+  trajectory_state_dim: 3
+  trajectory_units: metric_xy_metres_heading_radians
+  trajectory_rescaling: none
+  ego_observable_dim: 11
+  ego_tokens: 1
+  token_order: [scene, action, register]
+  group_allow: [[1, 0, 0], [1, 1, 1], [1, 0, 1]]
+  action_reads_register: true
+  register_reads_action: false
+  register_self_causal: false
+  block_schedule: scene_then_register_then_action
+  register_init_inputs: [learned_time_queries, metric_source_trajectory, immutable_mode_code]
+  action_init_inputs: [source, immutable_mode_code, action_time_embedding, projected_clean_ego]
+  clean_ego_source: [current_pose3, current_velocity2, current_acceleration2, route_command4]
+  clean_ego_drivor_order: [pose3, velocity2, acceleration2, route_command4]
+  clean_ego_encoding: single_linear_11_to_d_model
+  clean_ego_shared_before_action_projection: true
+  separate_scene_action_register_parameters: true
+  detach_register_memory_for_action_gradient: true
+  dropout: 0.0
+  output: endpoint_plus_predicted_register
+  action_codec: drivor_metric_xy_heading
+  action_branch: simwan_action_dit_wan22_initialized
+  action_dit:
+    hidden_dim: 256
+    ffn_dim: 1024
+    num_layers: 8
+    num_heads: 4
+    attn_head_dim: 64
+    text_dim: 256
+    freq_dim: 256
+    eps: 0.000001
+    action_dim: 3
+    qk_rmsnorm_before_rope: true
+    self_attention_rope: true
+    cross_attention_rope: false
+    modulation_segments_per_block: 6
+    modulation_segments_in_head: 2
+    ffn_activation: gelu_tanh
+  wan_backbone:
+    source: /mnt/LLM_weight/Wan-AI/Wan2.2-TI2V-5B
+    payload: checkpoints/ActionDiT_Wan22_256hdim_3outdim.pt
+    source_layers: 30
+    layer_map: [0, 3, 7, 11, 15, 18, 22, 26]
+    interpolation: sequential_1d_linear_align_corners_true
+    alpha_scaling: true
+    skip_prefixes: [action_encoder., head., mode_projection., ego_to_action_projection., time_queries]
+    loaded_keys: 226
+    load_strictness: strict_true_full_state_dict
+  action_sampling_loops: 0
+  random_flow_time_training: false
+  # The shared v6 spec withdrew the trajectory->Register path (its "attack 5"), and
+  # that withdrawal still binds nvs_v6/nvs_v6_wan through config_v6_final.yaml.  This
+  # e2e contract deliberately reverses it for this package only: Stage 1 is a
+  # trajectory-conditioned future representation, and a Register that cannot see the
+  # trajectory can only ever predict one scene's average future.  Measured on 16 real
+  # scenes, two GTs' compressed targets sit 0.205 apart against 0.542 across scenes,
+  # so the signal exists; the anchor-only Stage 1 recovered 0.4% of it.
+  physical_trajectory_to_register_readout: true
+  # Reversing that flag changes the Register's *initialisation*, not the directed
+  # attention: R still never reads A, and Scene is still never updated by A or R.
+  register_conditioning_path: initialisation_feature_not_attention_key
+  register_stage1_mode_code: omitted_to_prevent_row_index_shortcut
+  stage1_pairing: identity_one_register_row_per_gt
+  stage1_hungarian: unused_pairing_is_given_by_the_dataset
+scorer:
+  source: vendor/DrivoR/navsim/agents/drivoR
+  implementation: ScratchDrivoRScorer
+  initialization: scratch_random_no_drivor_checkpoint
+  feature_source: nvs_dinov3_scene_context
+  native_dinov2_scene_cache: false
+  native_ego_cache: false
+  candidates: 64
+  poses_per_candidate: 8
+  d_model: 256
+  trajectory_projection: [linear_24_1024, relu, linear_1024_256]
+  candidate_decoder_layers: 4
+  decoder_attention_heads: 1
+  head_hidden_dim: 1024
+  projection_dropout: 0.1
+  drop_path: 0.2
+  own_future_attention_layers: 0
+  sequence: [candidate_self_attention, nvs_scene_cross_attention, nvs_ego_token_addition, drivor_six_heads]
+  ego_pool: last_scene_token
+  cross_candidate_attention_after_future: false
+  predicted_register_is_input: false
+  # DrivoR detaches only the proposals (`pos_embed(proposals...detach())`,
+  # drivor_model.py:247) and feeds `scene_features` in attached (line 248), so
+  # the score loss does shape the Scene branch.  NVS reproduces that exactly.
+  input_detach: [trajectory, predicted_register]
+  scene_kv_detached: false
+  updates_generator: false
+  updates_trajectory_branch: false
+  updates_register: false
+  updates_scene_lora: true
+  future_fusion: none
+  train_future_dropout: 0.0
+  head_names: [NC, DAC, DDC, TTC, EP, C]
+  label_policy: drivor_nc_ddc_half_to_zero_otherwise_raw_soft_targets
+  ttc_invalid_sentinel: 2.0
+  head_loss_weights: {NC: 1.0, DAC: 1.0, DDC: 1.0, TTC: 1.0, EP: 1.0, C: 1.0}
+  selection_weights: {NC: 1.0, DAC: 1.0, DDC: 0.0, TTC: 5.0, EP: 5.0, C: 2.0}
+  rank_aux_enabled: false
+  native_drivor_optional_aux_heads: false
+oracle:
+  supervision: online_current_full64
+  scene_cache_lru: true
+  candidate_score_cache_as_training_source: false
+  backend: audited_drivor_compatible_pdm
+  raw_order: [NC, DAC, EP, TTC, C, DDC, Final]
+  worker_unit: whole_scene_candidate_set
+  require_per_head_valid_mask: true
+  async: false
+stage1:
+  task: mode_conditioned_future_pretraining
+  entrypoint: scripts/run_stage1_multiview.py
+  future_target_source: generated_multiview_future_mp4
+  action_input: no_action_forward_clean_anchors_only_in_assignment
+  model_inputs: [observations, immutable_mode_codes]
+  assignment: unique_hungarian_clean_anchor_metric_xy_l1
+  loss: matched_future_l1
+  train: [student_lora, scene_queries, student_neck, ego_hist_encoding, frame_time_embedding, scene_blocks, register_branch]
+  freeze: [dino_base, teacher, target_compressor, action_branch, scorer]
+  online_oracle: false
+  epochs_start: 50
+stage2:
+  task: paired_generation_and_online_scoring
+  model_inputs: [observations, deterministic_action_sources, immutable_mode_codes]
+  full_action_stack_traversals: 1
+  assignment: unique_hungarian_predicted_metric_xy_l1
+  same_assignment_for_action_and_future: true
+  loss_action: matched_residual_velocity_mse
+  loss_future: matched_future_l1
+  loss_score: original_drivor_score_loss_all64
+  train: [student_lora, scene_queries, student_neck, ego_hist_encoding, frame_time_embedding, scene_blocks, action_branch, register_branch, scorer]
+  freeze: [dino_base, teacher, target_compressor]
+  online_oracle: true
+  epochs_start: 50
+loss:
+  lambda_future_stage1: 1.0
+  lambda_action_stage2: 1.0
+  lambda_future_stage2: 0.1
+  lambda_score_stage2: 1.0
+  supervise_unmatched_future: false
+  independent_future_matching: false
+optimization:
+  new_module_lr: 0.0002
+  lora_lr: 0.00001
+  scorer_lr: 0.0005
+  weight_decay: 0.01
+  warmup_fraction: 0.1
+  grad_clip_norm: 1.0
+  optimizers_have_disjoint_parameters: true
+  complete_all_backward_before_step: true
+  use_bf16_if_supported: true
+  gradient_checkpointing: false
+  smoke_batch_size: 1
+  smoke_candidates: 8
+  production_candidates: 64
+  ddp_allow_unused_with_audit: true
+data:
+  # The real directory.  /mnt/data/multi_view/navtrain_full_allcosmos_cuda_v1_gpu64/
+  # navtrain_full_allcosmos_cuda_v1_gpu64 is a symlink to this one (same 103075
+  # scenes), so naming the target keeps `readlink -f` a no-op and makes the audit
+  # logs match what the loader actually opens.
+  multiview_root: /mnt/data/multi_future_view/navtrain_full_allcosmos_cuda_v1_gpu64/navtrain_full_allcosmos_cuda_v1_gpu64
+  multiview_future_container: mp4
+  multiview_future_frames: 41
+  multiview_future_fps: 10
+  multiview_future_indices: [5, 10, 15, 20, 25, 30, 35, 40]
+  multiview_video_hw: [464, 832]
+  multiview_trajectory_source: trajectory_k/ego_pose.npy
+  multiview_pose_frame: t0_local_rear_x_forward_y_left_yaw_ccw_metres_radians
+  multiview_degenerate_flag: duplicate_trajectory_label
+  multi_gt_format: scene_directory_or_legacy_npz
+  multi_gt_future_sampling: 0.5s
+  navsim_sensor_root: /mnt/data/navsim/trainval_sensor_blobs/trainval
+  navsim_log_root: /mnt/data/navsim/trainval_navsim_logs/trainval
+  navsim_log_rate_hz: 2
+  history_image_resolution: log_cams_data_path_by_camera_token
+  online_drivor_metric_cache: /mnt/zhaozc_workspace/project/DrivoR_multigt_kvcache_final_20261004/data_runtime/train_metric_cache
+  offline_fastwam_metric_cache: /mnt/zhaozc_workspace/project/FastWAM/data/metric_cache_navtrain
+  offline_cache_requires_trajectory_key: true

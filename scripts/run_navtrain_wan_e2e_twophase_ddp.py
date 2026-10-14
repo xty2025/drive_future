@@ -744,6 +744,11 @@ def main() -> int:
     log0(dctx, {"event": "cache_build_start", "cache_dir": str(cache_dir)})
     build_stats = run_cache_build(args, dctx, model, dataset, oracle, modes, initializer, cache_dir)
     shard = torch.load(cache_dir / f"shard_{dctx.rank}.pt", map_location="cpu")
+    if "gt" not in shard:
+        gt, gt_ok = load_navtrain_gt(shard["scene_ids"], args.multigt_root)
+        shard["gt"], shard["gt_ok"] = gt, gt_ok
+        log0(dctx, {"event": "gt_attached", "scenes": int(gt.shape[0]),
+                    "gt_ok_rate": round(float(gt_ok.float().mean()), 4)})
     barrier(dctx)
     log0(dctx, {"event": "cache_build_done", "rank0_cached": build_stats["cached"], "rank0_skipped": build_stats["skipped"],
                 "elapsed_s": build_stats["elapsed_s"]})

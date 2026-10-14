@@ -173,47 +173,55 @@ def _trajectory_errors(predicted: torch.Tensor, targets: torch.Tensor) -> dict[s
 def _future_fit_metrics(
     samples: list[PairedRolloutSample],
     model: DirectedPairDiT,
-    modes: ImmutableModeBuffer,
-    initializer: StructuredSourceInitializer,
 ) -> dict[str, object]:
-    """Measure the exact Stage-1 paired-future objective and a shuffled control."""
+    """Stage-1's identity-paired future objective plus a shuffled and a blind control.
+
+    Row ``k`` of the register is conditioned on GT ``k``'s own metric trajectory and
+    scored against GT ``k``'s compressed future, exactly as ``stage1_step`` trains it.
+    ``shuffled_pair_l1`` scores row ``k`` against GT ``k+1`` and ``trajectory_blind_l1``
+    re-runs the scene with every row conditioned on GT 0's trajectory, so an overfit
+    that came from the row index or from the scene alone cannot pass for one that came
+    from the trajectory.
+    """
+
     was_training = model.training
     model.eval()
     rows = []
     for sample in samples:
-        mode_codes = modes.expand_for_batch(1, sample.observation.rgb_history.device)
-        predicted = model.forward_register_only(sample.observation, mode_codes)
-        clean = initializer.clean(sample.observation.ego_history, mode_codes)
-        clean_trajectory = torch.stack(
-            (clean[..., 0] * 20.0, clean[..., 1] * 20.0, torch.atan2(clean[..., 2], clean[..., 3])),
-            dim=-1,
-        )
-        assignment = hungarian_xy(clean_trajectory, sample.targets.gt_trajectory, sample.targets.gt_valid)
-        own_loss = paired_future_l1(predicted, sample.targets, assignment)
-        match = assignment[0]
-        own_errors = []
-        shuffled_errors = []
-        pairs = match.as_pairs()
-        for pair_index, (gt_index, candidate_index) in enumerate(pairs):
-            valid = sample.targets.future_chunk_valid[0, gt_index]
-            own_target = sample.targets.future_register[0, gt_index]
-            shuffled_gt = pairs[(pair_index + 1) % len(pairs)][0]
-            shuffled_target = sample.targets.future_register[0, shuffled_gt]
-            own_errors.append((predicted[0, candidate_index, valid] - own_target[valid]).abs().mean())
-            shuffled_errors.append((predicted[0, candidate_index, valid] - shuffled_target[valid]).abs().mean())
+        targets = sample.targets
+        gt_count = int(targets.gt_valid[0].sum())
+        source = targets.gt_trajectory[:, :gt_count]
+        predicted = model.forward_register_only(sample.observation, source)[0]
+        own_target = targets.future_register[0, :gt_count]
+        chunk_valid = targets.future_chunk_valid[0, :gt_count]
+        weights = targets.future_quality[0, :gt_count] * chunk_valid.to(targets.future_quality.dtype)
+
+        def weighted_error(prediction: torch.Tensor, target: torch.Tensor) -> float:
+            error = (prediction - target).abs().mean(dim=-1)
+            return float((error * weights).sum() / weights.sum().clamp_min(1e-8))
+
+        blind_source = source[:, :1].expand(-1, gt_count, -1, -1).contiguous()
+        blind_predicted = model.forward_register_only(sample.observation, blind_source)[0]
         rows.append(
             {
                 "scene_id": sample.scene_id,
-                "matched": len(pairs),
-                "paired_future_l1": float(own_loss),
-                "shuffled_pair_l1": float(torch.stack(shuffled_errors).mean()),
-                "register_mode_std": float(predicted[0].std(dim=0).mean()),
+                "gt_count": gt_count,
+                "supervised_rows": gt_count,
+                "paired_future_l1": weighted_error(predicted, own_target),
+                "shuffled_pair_l1": (
+                    weighted_error(predicted, torch.roll(own_target, -1, dims=0)) if gt_count > 1 else float("nan")
+                ),
+                "trajectory_blind_l1": (
+                    weighted_error(blind_predicted, own_target) if gt_count > 1 else float("nan")
+                ),
+                "register_mode_std": float(predicted.std(dim=0).mean()),
             }
         )
     model.train(was_training)
     return {
         "mean_paired_future_l1": float(np.mean([row["paired_future_l1"] for row in rows])),
-        "mean_shuffled_pair_l1": float(np.mean([row["shuffled_pair_l1"] for row in rows])),
+        "mean_shuffled_pair_l1": float(np.nanmean([row["shuffled_pair_l1"] for row in rows])),
+        "mean_trajectory_blind_l1": float(np.nanmean([row["trajectory_blind_l1"] for row in rows])),
         "scenes": rows,
     }
 
@@ -293,7 +301,7 @@ def main() -> int:
         "psi": _parameter_norm(scorer.parameters()),
     }
     phi_time_queries_before = model.phi_time_queries.detach().clone()
-    stage1_future_before = _future_fit_metrics(samples, model, modes, initializer)
+    stage1_future_before = _future_fit_metrics(samples, model)
 
     # DrivoR scales its 5e-4 base LR by sqrt(global_batch/64).
     scorer_lr = 5e-4 * (len(samples) / 64.0) ** 0.5
@@ -304,15 +312,15 @@ def main() -> int:
     for epoch in range(args.stage1_epochs):
         losses = []
         for _ in range(args.steps_per_epoch):
-            result = stage1_step(batch_observation, batch_targets, model, stage1_optimizer, modes, initializer)
+            result = stage1_step(batch_observation, batch_targets, model, stage1_optimizer)
             losses.append(float(result.loss_future))
         rows = [
             {
                 "scene_id": sample.scene_id,
                 "gt_count": sample.metadata["gt_count"],
-                "matched": len(result.assignment[index].as_pairs()),
+                "supervised_rows": int(sample.targets.gt_valid.sum()),
             }
-            for index, sample in enumerate(samples)
+            for sample in samples
         ]
         stage1_epochs.append(
             {
@@ -320,17 +328,21 @@ def main() -> int:
                 "steps": args.steps_per_epoch,
                 "mean_loss_future": float(np.mean(losses)),
                 "last_loss_future": losses[-1],
+                "batch_supervised_rows": int(result.supervised_rows),
                 "scenes": rows,
             }
         )
         print(json.dumps({"stage": 1, **stage1_epochs[-1]}), flush=True)
 
-    stage1_future_after = _future_fit_metrics(samples, model, modes, initializer)
+    stage1_future_after = _future_fit_metrics(samples, model)
     stage1_future_audit = {
         "before": stage1_future_before,
         "after": stage1_future_after,
         "loss_decreased": stage1_future_after["mean_paired_future_l1"] < stage1_future_before["mean_paired_future_l1"],
         "paired_better_than_shuffled": stage1_future_after["mean_paired_future_l1"] < stage1_future_after["mean_shuffled_pair_l1"],
+        "paired_better_than_trajectory_blind": (
+            stage1_future_after["mean_paired_future_l1"] < stage1_future_after["mean_trajectory_blind_l1"]
+        ),
         "phi_time_query_update_l2": float((model.phi_time_queries.detach() - phi_time_queries_before).float().norm()),
     }
     print(json.dumps({"stage": 1, "future_audit": stage1_future_audit}), flush=True)

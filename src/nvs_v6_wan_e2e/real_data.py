@@ -20,8 +20,8 @@ from .data import (
     PairTargets,
     drivor_observable_ego_feature,
     drivor_route_command,
-    encode_trajectory,
 )
+from .vision import DRIVOR_OFFICIAL_IMAGE_HW
 
 
 @dataclass
@@ -37,9 +37,16 @@ class RealNavsimSample:
     metadata: dict[str, Any]
 
 
-def _load_image(path: Path, image_size: int) -> torch.Tensor:
+def _load_image(path: Path, image_hw: tuple[int, int]) -> torch.Tensor:
+    """DrivoR's preprocessing: PIL resize to (W,H), /255 only -- no normalization.
+
+    ``DrivoRDinoV3Student._prepare`` applies the ImageNet mean/std, exactly where
+    DrivoR's ``DrivoRFeatureBuilder`` applies it, so loading stays raw here.
+    """
+
+    height, width = int(image_hw[0]), int(image_hw[1])
     with Image.open(path) as image:
-        image = image.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
+        image = image.convert("RGB").resize((width, height), Image.Resampling.BICUBIC)
         array = np.asarray(image, dtype=np.float32) / 255.0
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
@@ -52,9 +59,9 @@ def _relative_pose(reference: np.ndarray, frame: np.ndarray) -> np.ndarray:
     )
 
 
-def _frame_image(frame: dict[str, Any], sensor_root: Path, camera: str, image_size: int) -> torch.Tensor:
+def _frame_image(frame: dict[str, Any], sensor_root: Path, camera: str, image_hw: tuple[int, int]) -> torch.Tensor:
     relative = Path(frame["cams"][camera]["data_path"])
-    return _load_image(sensor_root / relative, image_size)
+    return _load_image(sensor_root / relative, image_hw)
 
 
 def _find_multigt(multigt_root: Path, frame_token: str) -> Path:
@@ -71,7 +78,7 @@ def load_real_navsim_sample(
     multigt_root: str | Path,
     frame_index: int = 755,
     camera: str = "CAM_F0",
-    image_size: int = 224,
+    image_hw: tuple[int, int] = DRIVOR_OFFICIAL_IMAGE_HW,
     cache_root: str | Path = "/mnt/zhaozc_workspace/project/DrivoR_multigt_kvcache_final_20261004/data_runtime/train_metric_cache",
     target_dim: int = 256,
 ) -> RealNavsimSample:
@@ -95,8 +102,8 @@ def load_real_navsim_sample(
     for image_path in source_image_paths:
         with Image.open(image_path) as source_image:
             source_image_hw.append([int(source_image.height), int(source_image.width)])
-    rgb_history = torch.stack([_frame_image(frames[i], sensor_root, camera, image_size) for i in context_indices])
-    future_rgb = torch.stack([_frame_image(frames[i], sensor_root, camera, image_size) for i in future_indices])
+    rgb_history = torch.stack([_frame_image(frames[i], sensor_root, camera, image_hw) for i in context_indices])
+    future_rgb = torch.stack([_frame_image(frames[i], sensor_root, camera, image_hw) for i in future_indices])
     relative_poses = torch.from_numpy(np.stack([_relative_pose(reference, np.asarray(frames[i]["ego2global"], dtype=np.float64)) for i in context_indices]))
     ego_features = []
     for index, pose in zip(context_indices, relative_poses):
@@ -115,12 +122,17 @@ def load_real_navsim_sample(
     if trajectories.ndim != 3 or trajectories.shape[1:] != (8, 3):
         raise ValueError(f"unexpected Multi-GT shape {tuple(trajectories.shape)} at {multi_gt_dir}")
     gt_count = trajectories.shape[0]
+    # This adapter has no Teacher target: the Future Register must be marked
+    # INVALID rather than valid-with-zeros.  Zeros carrying chunk_valid=True
+    # silently train the register toward the origin, which is why the joint
+    # trainer had to freeze phi and hardcode lambda_future=0.  Real targets come
+    # from scripts/build_future_target_cache.py and are read back by
+    # target_cache.Stage1SceneDataset / scene_target_path.
     future_register = torch.zeros(gt_count, 4, target_dim, dtype=torch.float32)
-    future_chunk_valid = torch.ones(gt_count, 4, dtype=torch.bool)
-    future_quality = torch.ones(gt_count, 4, dtype=torch.float32)
+    future_chunk_valid = torch.zeros(gt_count, 4, dtype=torch.bool)
+    future_quality = torch.zeros(gt_count, 4, dtype=torch.float32)
     targets = PairTargets(
         gt_trajectory=trajectories.unsqueeze(0),
-        gt_encoded=encode_trajectory(trajectories).unsqueeze(0),
         gt_valid=valid.unsqueeze(0),
         future_register=future_register.unsqueeze(0),
         future_chunk_valid=future_chunk_valid.unsqueeze(0),
@@ -147,7 +159,7 @@ def load_real_navsim_sample(
         "history_indices": context_indices,
         "future_indices": future_indices,
         "source_image_hw": source_image_hw,
-        "loaded_observation_shape": [1, 5, 1, 3, image_size, image_size],
+        "loaded_observation_shape": [1, 5, 1, 3, int(image_hw[0]), int(image_hw[1])],
         "camera_count": 1,
         "history_frames": 4,
         "cache_path": str(cache_path),

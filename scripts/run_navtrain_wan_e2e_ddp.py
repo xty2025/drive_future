@@ -1,24 +1,50 @@
 """Full-navtrain JOINT Stage-2 training with the Wan ActionDiT variant (DDP).
 
-This launcher is strictly additive: it only imports and calls ``nvs_v6_wan_e2e`` and
-never edits any package file, so the architecture under test is untouched.
+This is the single supported training entry point for the ``nvs_v6_wan_e2e``
+lineage.  It imports and calls the package without editing it.
 
 Architecture / supervision
 --------------------------
-* Generator = ``nvs_v6_wan_e2e.DirectedPairDiT`` (Wan ActionDiT: per-candidate
-  self-attention with QK-RMSNorm + 1D RoPE, cross-attention over
-  ``[Scene(66) | sg(Register)(4)]``, six-parameter adaLN modulation and a
-  ``WanActionHead`` single-step residual-endpoint readout).  Every Wan module is
-  randomly initialized; no Wan or DrivoR weights are ever loaded.
-* ``--future-target none`` (the only supported mode here): ``lambda_future = 0``.
-  The joint loss is ``lambda_action * paired_residual_velocity_mse +
-  lambda_score * scorer.source_loss``.  The register/future branch ``phi`` is
-  still executed (its four tokens are read DETACHED by the action branch) but it
-  receives no gradient, so it is frozen and excluded from the optimizer.
-* ``eta`` + ``theta`` are trained by the action loss; ``psi``
-  (``ScratchDrivoRScorer``, ``scratch_random``) is trained by the DrivoR score
-  loss against the streaming online oracle ``DrivoRBatchMetricCacheOracle``
-  (official ``get_sub_score``, lazily evaluated per scene, never pre-hashed).
+* Generator = ``nvs_v6_wan_e2e.DirectedPairDiT``.  ``theta`` is the Wan2.2
+  ActionDiT at ``hidden_dim=256``: per-candidate self-attention with QK-RMSNorm +
+  1D RoPE, cross-attention over ``[Scene | sg(Register)]``, six-parameter adaLN
+  modulation and a modulated velocity head.  Its backbone is loaded from
+  ``--wan-backbone`` (``checkpoints/ActionDiT_Wan22_256hdim_3outdim.pt``, built by
+  ``scripts/preprocess_wan_action_dit.py``) with ``strict=True``; only
+  ``action_encoder``/``head``/the NVS condition projections stay random.
+  ``--heads`` must be 4, the payload's ``num_heads``.
+* ``theta`` is a rectified-flow denoiser (see ``nvs_v6_wan_e2e.flow``).  The 64
+  anchors are the ``sigma = 1`` endpoint and each candidate's matched GT is the
+  ``sigma = 0`` endpoint, so ``x_sigma = (1-sigma)*gt + sigma*anchor`` and the
+  single-forward inverse ``x0 = x_sigma - sigma*v`` returns a metric trajectory
+  with no rollout at train or eval time (``action_sampling_loops: 0``).  One
+  random ``t`` is drawn per scene per step, exactly as SimWAM samples it.
+* Trajectory loss is DrivoR's own objective, generalized to Multi-GT:
+  full-weight Hungarian L1 minADE on the matched pairs + ``diversity_loss`` + a
+  small dense nearest-GT pull that gives all 64 candidates gradient.  The
+  previous hard-Hungarian L2 supervised exactly one candidate per scene and
+  matched on ``[:, :2]`` only, so heading was never supervised -- that is why
+  only the matched few looked good.
+* ``--lambda-velocity`` adds SimWAM's ``v_loss``: MSE on the flow velocity in
+  ``norm_odo`` units, bell-weighted by ``t``.  Normalized units matter because the
+  metric L1 term weights 1 m of ``x`` the same as 1 rad (57 deg) of heading.
+* Future Register loss (``--lambda-future``) is dense over the 64 candidates via
+  ``dense_future_l1`` and needs real Teacher targets: pass ``--future-target
+  cache --target-cache-root`` pointing at a ``build_future_target_cache.py``
+  output, which also unfreezes phi.  Without it ``--lambda-future`` must be 0 and
+  the branch stays frozen, so it can never be silently trained toward all-zero
+  placeholders.
+* ``eta`` + ``theta`` (+ ``phi`` when the future cache is present) are trained by
+  the trajectory/velocity/future losses; ``psi`` (``ScratchDrivoRScorer``) by the
+  DrivoR score loss against the streaming online oracle
+  ``DrivoRBatchMetricCacheOracle``.  The score gradient path is DrivoR's verbatim:
+  proposals enter the scorer DETACHED while the Scene context stays ATTACHED.
+* ``--stage1-checkpoint`` restores eta+phi+theta from ``run_stage1_multiview.py``
+  with ``strict=True`` and leaves the scorer at scratch init, which is the
+  Stage-1-then-Stage-2 order the future representation is trained for.
+
+Loss weights follow DrivoR's and SimWAM's published ratios (see the ``setup``
+event): action 1.0 / score 1.0 / rank 0.1 / velocity 1.0 / future 0.1.
 
 Distributed
 -----------
@@ -27,12 +53,9 @@ trainable parameter.  Launch with torchrun on a single node, e.g.
 ``torchrun --standalone --nnodes=1 --nproc_per_node=16``.  ``DistributedSampler``
 and ``DataLoader`` both use ``drop_last=True`` to keep ranks in lockstep; the
 process-group timeout is long enough to absorb per-rank oracle/data skew.  Every
-``--log-every`` optimizer steps (default 10) rank 0 prints step, losses, LR and
-eval progress (selected vs oracle-best PDMS, oracle-match rate, matched-GT ADE),
-all-reduced across ranks.
-
-This file is intentionally a SEPARATE copy from the two-phase trainer
-(``run_navtrain_wan_twophase_ddp.py``); the two are not merged on purpose.
+``--log-every`` optimizer steps rank 0 prints step, losses, LR and eval progress
+(selected vs oracle-best PDMS, oracle-match rate, matched-GT ADE and the all-64
+nearest-GT ADE that measures overall set quality), all-reduced across ranks.
 """
 
 from __future__ import annotations
@@ -54,21 +77,35 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-from nvs_v6_wan_e2e.data import Observation
+from nvs_v6_wan_e2e.data import Observation, PairTargets
+from nvs_v6_wan_e2e.flow import INFERENCE_SIGMA
 from nvs_v6_wan_e2e.losses import (
     assert_disjoint_parameter_groups,
+    dense_future_l1,
+    flow_velocity_loss,
+    gather_flow_data,
     hungarian_xy,
-    paired_residual_velocity_mse,
+    multigt_trajectory_loss,
+    nearest_gt_index,
 )
 from nvs_v6_wan_e2e.model import DirectedPairDiT, parameter_groups
 from nvs_v6_wan_e2e.modes import ImmutableModeBuffer, StructuredSourceInitializer
 from nvs_v6_wan_e2e.oracle import DrivoRBatchMetricCacheOracle
 from nvs_v6_wan_e2e.real_data import load_real_navsim_sample
 from nvs_v6_wan_e2e.scorer import ScratchDrivoRScorer
+from nvs_v6_wan_e2e.selection import aggregate_score_logits
 from nvs_v6_wan_e2e.stages import _set_generator_trainability
+from nvs_v6_wan_e2e.target_cache import compressor_path, read_scene_payload, scene_target_path
+from nvs_v6_wan_e2e.vision import (
+    DRIVOR_LORA_RANK,
+    DRIVOR_NUM_SCENE_TOKENS,
+    DRIVOR_OFFICIAL_IMAGE_HW,
+)
+from navsim.agents.drivoR.preference_module import mine_pair
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +122,7 @@ DEFAULT_SENSOR = _env("NVS_SENSOR_ROOT", "/mnt/data/navsim/trainval_all/trainval
 DEFAULT_LOG_ROOT = _env("NVS_LOG_ROOT", "/mnt/data/navsim/trainval_navsim_logs/trainval")
 DEFAULT_CACHE = _env("NVS_CACHE_ROOT", "/mnt/zhaozc_workspace/official_DrivoR_clean/data_runtime/official_metric_cache_navtrain_20261005/metric_cache")
 DEFAULT_DINO = _env("NVS_DINO_CHECKPOINT", "/mnt/LLM_weight/timm/vit_large_patch16_dinov3.lvd1689m/model.safetensors")
+DEFAULT_WAN_BACKBONE = _env("NVS_WAN_BACKBONE", "checkpoints/ActionDiT_Wan22_256hdim_3outdim.pt")
 DEFAULT_OUTPUT = _env("NVS_OUTPUT_DIR", "artifacts/navtrain_wan_e2e_ddp")
 ORACLE_VERSION = "drivor_get_sub_score_navtrain_20261005"
 
@@ -299,6 +337,8 @@ class NavtrainSceneDataset(Dataset):
         multigt_root: str,
         cache_root: str,
         log_root: str,
+        target_cache_root: str | None = None,
+        target_dim: int = 256,
         max_retry: int = 12,
     ) -> None:
         self.candidates = candidates
@@ -306,6 +346,8 @@ class NavtrainSceneDataset(Dataset):
         self.multigt_root = multigt_root
         self.cache_root = cache_root
         self.log_root = log_root
+        self.target_cache_root = target_cache_root
+        self.target_dim = target_dim
         self.max_retry = max_retry
 
     def __len__(self) -> int:
@@ -328,6 +370,7 @@ class NavtrainSceneDataset(Dataset):
                 last_error = error
                 continue
             observation, targets = sample.observation, sample.targets
+            future = self._cached_future(candidate.token, targets.gt_trajectory.shape[0])
             return {
                 "rgb_history": observation.rgb_history[0],
                 "history_valid": observation.history_valid[0],
@@ -335,11 +378,46 @@ class NavtrainSceneDataset(Dataset):
                 "route_command": observation.route_command[0],
                 "relative_ego_poses": observation.relative_ego_poses[0],
                 "gt_trajectory": targets.gt_trajectory[0],
-                "gt_encoded": targets.gt_encoded[0],
                 "gt_valid": targets.gt_valid[0],
+                "future_register": future["future_register"],
+                "future_chunk_valid": future["future_chunk_valid"],
+                "future_quality": future["future_quality"],
                 "scene_id": candidate.token,
             }
         raise RuntimeError(f"could not load any scene near index {index}: {last_error!r}")
+
+    def _cached_future(self, scene_id: str, gt_count: int) -> dict[str, torch.Tensor]:
+        """Real Teacher Future Register targets, or honest invalid placeholders.
+
+        ``load_real_navsim_sample`` cannot synthesize future views, so without a
+        target cache it reports ``future_chunk_valid=False`` and the future loss
+        becomes an exact zero instead of training the register toward all-zero
+        targets.  With ``--target-cache-root`` the cached Teacher compression
+        (8 future frames -> 4 chunks of 2 frames -> PCA 256) is read back.
+        """
+        if self.target_cache_root is None:
+            return {
+                "future_register": torch.zeros(gt_count, 4, self.target_dim),
+                "future_chunk_valid": torch.zeros(gt_count, 4, dtype=torch.bool),
+                "future_quality": torch.zeros(gt_count, 4),
+            }
+        payload = read_scene_payload(scene_target_path(self.target_cache_root, scene_id))
+        register = payload["future_register"]
+        if register.shape[0] != gt_count:
+            raise ValueError(
+                f"scene {scene_id}: cached future_register has {register.shape[0]} GT rows, "
+                f"the Multi-GT artifact has {gt_count}"
+            )
+        if register.shape[-1] != self.target_dim:
+            raise ValueError(
+                f"scene {scene_id}: cached future_register is {register.shape[-1]}-d, "
+                f"the model was built with --target-dim {self.target_dim}"
+            )
+        return {
+            "future_register": register,
+            "future_chunk_valid": payload["future_chunk_valid"],
+            "future_quality": payload["future_quality"],
+        }
 
 
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -361,8 +439,10 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "route_command": torch.stack([item["route_command"] for item in batch]),
         "relative_ego_poses": torch.stack([item["relative_ego_poses"] for item in batch]),
         "gt_trajectory": pad_ground_truth("gt_trajectory", 0.0),
-        "gt_encoded": pad_ground_truth("gt_encoded", 0.0),
         "gt_valid": pad_ground_truth("gt_valid", False),
+        "future_register": pad_ground_truth("future_register", 0.0),
+        "future_chunk_valid": pad_ground_truth("future_chunk_valid", False),
+        "future_quality": pad_ground_truth("future_quality", 0.0),
         "scene_ids": [item["scene_id"] for item in batch],
     }
 
@@ -377,10 +457,24 @@ def batch_to_device(batch: dict[str, Any], device: torch.device) -> tuple[Observ
     )
     targets = {
         "gt_trajectory": batch["gt_trajectory"].to(device, non_blocking=True),
-        "gt_encoded": batch["gt_encoded"].to(device, non_blocking=True),
         "gt_valid": batch["gt_valid"].to(device, non_blocking=True),
+        "future_register": batch["future_register"].to(device, non_blocking=True),
+        "future_chunk_valid": batch["future_chunk_valid"].to(device, non_blocking=True),
+        "future_quality": batch["future_quality"].to(device, non_blocking=True),
     }
     return observation, targets, batch["scene_ids"]
+
+
+def pair_targets(targets: dict[str, torch.Tensor]) -> PairTargets:
+    """View the batch dict as the ``PairTargets`` the future losses expect."""
+    return PairTargets(
+        gt_trajectory=targets["gt_trajectory"],
+        gt_valid=targets["gt_valid"],
+        future_register=targets["future_register"],
+        future_chunk_valid=targets["future_chunk_valid"],
+        future_quality=targets["future_quality"],
+        pair_ids=None,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -392,29 +486,83 @@ class JointStage2Module(nn.Module):
         self.model = model
         self.scorer = scorer
 
-    def forward(self, observation: Observation, source: torch.Tensor, modes: torch.Tensor):
-        outputs = self.model.forward_pairs(observation, source, modes)
-        logits = self.scorer(outputs.scene_context, outputs.trajectory, None)
-        # trajectory is returned detached: it feeds only the no-grad oracle and
-        # the Hungarian assignment, never the loss, so DDP traces endpoint+logits.
-        return outputs.endpoint, outputs.trajectory.detach(), logits
+    def forward(
+        self,
+        observation: Observation,
+        source: torch.Tensor,
+        modes: torch.Tensor,
+        flow_data: torch.Tensor,
+        timestep: torch.Tensor,
+    ):
+        """One rectified-flow forward: noisy action in, metric trajectory out.
+
+        ``flow_data`` (the per-candidate ``sigma = 0`` endpoint) and ``timestep``
+        are computed outside because neither touches a parameter, which keeps DDP's
+        forward a pure function of the parameters it must reduce.
+        """
+        flow = self.model.forward_flow(observation, source, modes, flow_data, timestep)
+        outputs = flow.pairs
+        logits = self.scorer(outputs.scene_context, outputs.trajectory, outputs.predicted_register)
+        # endpoint/velocity/register carry the generator graph; logits carry psi
+        # plus eta through the scorer's attached Scene K/V.  velocity_target and the
+        # detached endpoint are parameter-free: they feed the v_loss target, the
+        # no-grad oracle, the Hungarian assignment and the metrics.
+        return (outputs.endpoint, flow.velocity, flow.velocity_target, outputs.predicted_register,
+                outputs.endpoint.detach(), logits)
+
+
+def first_valid_gt(gt_trajectory: torch.Tensor, gt_valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce multi-GT [B,K,8,3] to each scene's first valid GT [B,8,3] for mine_pair.
+
+    Mirrors load_navtrain_gt's single-GT choice so the Joint rank loss mines the
+    same chosen/rejected slots as Phase B.  gt_ok is False for all-invalid scenes.
+    """
+    idx = gt_valid.to(torch.long).argmax(dim=1)
+    rows = torch.arange(gt_trajectory.shape[0], device=gt_trajectory.device)
+    gt = gt_trajectory[rows, idx]
+    gt_ok = gt_valid.any(dim=1)
+    return gt, gt_ok
 
 
 # --------------------------------------------------------------------------- #
-# Optimizers / schedule (custom: phi frozen, so stages.build_optimizers is unusable).
+# Optimizers / schedule (custom: phi is frozen unless real future targets exist).
 # --------------------------------------------------------------------------- #
-def build_optimizers(model: DirectedPairDiT, scorer: ScratchDrivoRScorer, lr: float, scorer_lr: float, weight_decay: float):
+def build_optimizers(
+    model: DirectedPairDiT,
+    scorer: ScratchDrivoRScorer,
+    lr: float,
+    scorer_lr: float,
+    weight_decay: float,
+    train_phi: bool = False,
+):
     _set_generator_trainability(model, stage=2)  # freeze DINO base, keep LoRA + NVS scene/theta trainable
-    for parameter in model.phi.parameters():  # future/register branch: detached context, no supervision
-        parameter.requires_grad_(False)
-    model.phi_time_queries.requires_grad_(False)
+    if not train_phi:
+        # No Teacher target cache: the register would be supervised by nothing (or
+        # by all-zero placeholders), so the branch must not receive gradient at all.
+        for parameter in model.phi.parameters():
+            parameter.requires_grad_(False)
+        model.phi_time_queries.requires_grad_(False)
+    # 方案A（对齐 DrivoR 感知容量）：Joint 阶段冻结 scene_blocks（8 层 1007-token
+    # self-attn）。DrivoR 的 backbone 只训 LoRA、base 冻结，所以敢用 final_score_weight
+    # =1.0；我们额外训了大容量的 scene_blocks，未 detach 的 source_loss 会把它冲离
+    # Phase A 学到的 GT 表征（最早 sel 跌到 0.85 的根因）。冻结 scene_blocks 后可训
+    # 感知容量回到 LoRA 级别，source 才能安全提回 1.0 让 scorer utility 满强度训练。
+    # 冻结后 parameter_groups 自动跳过它们（requires_grad=False），下面的断言仍成立。
+    # Stage2 从 Stage1 的 checkpoint 续训，冻结 scene_blocks 也正是「保留 Stage1 学到
+    # 的未来表征、只学生成与打分」的实现方式。
+    # 回退：删掉这个 for 循环即恢复 scene_blocks 可训（详见 AGENTS.md「方案A」节）。
+    for name, parameter in model.named_parameters():
+        if name.startswith("scene_blocks."):
+            parameter.requires_grad_(False)
     for parameter in scorer.parameters():
         parameter.requires_grad_(True)
 
-    groups = parameter_groups(model)  # phi excluded because it is frozen
-    if groups["phi"]:
-        raise AssertionError("phi/register branch must be frozen when future-target=none")
-    generator_parameters = list(groups["eta"]) + list(groups["theta"])
+    groups = parameter_groups(model)
+    if not train_phi and groups["phi"]:
+        raise AssertionError("phi/register branch must be frozen when no future target cache is present")
+    if train_phi and not groups["phi"]:
+        raise AssertionError("--lambda-future > 0 needs a trainable phi branch")
+    generator_parameters = list(groups["eta"]) + list(groups["theta"]) + list(groups["phi"])
     scorer_parameters = list(scorer.parameters())
     assert_disjoint_parameter_groups(generator_parameters, scorer_parameters)
     expected = {id(p) for p in model.parameters() if p.requires_grad}
@@ -447,8 +595,15 @@ def batch_eval_metrics(
     labels_ok: bool,
     device: torch.device,
 ) -> torch.Tensor:
-    """Return [sel_pdms, oracle_best, match, ade, ade_n, score_ok] sums for this batch."""
-    out = torch.zeros(6, device=device)
+    """Return [sel, oracle_best, match, ade, ade_n, score_ok, near_ade, near_n] sums.
+
+    ``ade`` is the Hungarian-pair ADE: it measures the few candidates that won the
+    matching, so it stays low even when the other 60 are nonsense.  ``near_ade``
+    is every supervised candidate against its own nearest valid GT, which is the
+    number that actually reports overall set quality -- the user's complaint was
+    exactly that only the matched few looked good.
+    """
+    out = torch.zeros(8, device=device)
     ade_sum = 0.0
     ade_n = 0
     for row in range(trajectory.shape[0]):
@@ -459,6 +614,15 @@ def batch_eval_metrics(
     if ade_n:
         out[3] = ade_sum
         out[4] = float(ade_n)
+    nearest, supervised = nearest_gt_index(trajectory, targets["gt_trajectory"], targets["gt_valid"])
+    if bool(supervised.any()):
+        batch, candidates = nearest.shape
+        rows = torch.arange(batch, device=nearest.device).view(batch, 1).expand(batch, candidates)
+        gt_xy = targets["gt_trajectory"][rows, nearest][:, :, :, :2]
+        per_candidate = (trajectory[..., :2] - gt_xy).norm(dim=-1).mean(dim=-1)
+        masked = per_candidate[supervised]
+        out[6] = masked.sum()
+        out[7] = float(masked.numel())
     if labels_ok:
         selected, _utility = scorer.select(logits)
         final_score = labels.final_score.to(device)
@@ -483,10 +647,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scorer-lr", type=float, default=5e-4, help="scorer (psi) LR")
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--warmup", type=int, default=500, help="linear LR warmup optimizer-steps")
-    parser.add_argument("--lambda-action", type=float, default=1.0)
-    parser.add_argument("--lambda-score", type=float, default=1.0)
-    parser.add_argument("--future-target", default="none", choices=["none"], help="only 'none' is supported (lambda_future=0, phi frozen)")
+    parser.add_argument("--lambda-action", type=float, default=1.0,
+                        help="DrivoR trajectory_weight: Hungarian L1 minADE + dense + diversity")
+    parser.add_argument("--lambda-velocity", type=float, default=1.0,
+                        help="SimWAM v_loss weight: MSE on the rectified-flow velocity, bell-weighted by t")
+    parser.add_argument("--lambda-score", type=float, default=1.0,
+                        help="DrivoR final_score_weight: 6-head BCE against the online PDMS oracle")
+    parser.add_argument("--lambda-rank", type=float, default=0.1,
+                        help="weight of the DrivoR-style scorer ranking (margin) loss; 0 disables")
+    parser.add_argument("--lambda-future", type=float, default=0.1,
+                        help="dense Future Register L1; only applied with --future-target cache")
+    parser.add_argument("--dense-weight", type=float, default=0.1,
+                        help="DrivoR dense nearest-GT pull on the 60 unmatched candidates")
+    parser.add_argument("--diversity-weight", type=float, default=1.0,
+                        help="DrivoR anti-collapse spread penalty over the 64 candidates")
+    parser.add_argument("--dense-gate-m", type=float, default=8.0,
+                        help="candidates farther than this from every GT get no dense pull")
+    parser.add_argument("--unsafe-threshold", type=float, default=0.2,
+                        help="PDMS below this counts as an unsafe rejected slot for rank mining")
+    parser.add_argument("--future-target", default="none", choices=["none", "cache"],
+                        help="'cache' reads real Teacher Future Register targets from --target-cache-root "
+                             "and unfreezes phi; 'none' forces lambda_future=0 and keeps phi frozen")
+    parser.add_argument("--target-cache-root", default="",
+                        help="build_future_target_cache.py output holding compressor.pt and targets/")
+    parser.add_argument("--target-dim", type=int, default=256, help="Future Register width (must match Stage 1)")
     parser.add_argument("--depth", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=4,
+                        help="must equal the Wan payload's num_heads (4 at hidden_dim=256)")
+    parser.add_argument("--wan-backbone", default=DEFAULT_WAN_BACKBONE,
+                        help="ActionDiT_Wan22 payload from scripts/preprocess_wan_action_dit.py")
+    parser.add_argument("--stage1-checkpoint", default="",
+                        help="stage1_checkpoint.pt to restore eta+phi from; the scorer stays at scratch init")
     parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--log-every", type=int, default=10, help="print step/loss/eval this many optimizer-steps")
@@ -494,8 +685,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=0, help="stop after this many optimizer-steps (0 = full run)")
     parser.add_argument("--limit-scenes", type=int, default=0, help="cap the scene index (0 = full navtrain)")
     parser.add_argument("--find-unused", action="store_true", help="DDP find_unused_parameters=True (safer, slower)")
-    parser.add_argument("--use-all-native-tokens", action="store_true",
-                        help="output all 201 DINOv3 native tokens per frame (5x201+2=1007 scene tokens)")
+    parser.add_argument("--grad-checkpointing", action="store_true",
+                        help="checkpoint the DINOv3 student forward to cut activation memory")
     parser.add_argument("--multigt-root", default=DEFAULT_MULTIGT)
     parser.add_argument("--sensor-root", default=DEFAULT_SENSOR)
     parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT)
@@ -513,8 +704,30 @@ def main() -> int:
     args = parse_args()
     if args.candidates != 64:
         raise ValueError("the DrivoR online oracle requires exactly 64 candidates")
-    if args.future_target != "none":
-        raise ValueError("only --future-target none is supported by this joint trainer")
+
+    # ---- future supervision: real Teacher targets or nothing at all --------- #
+    args.target_cache_root = args.target_cache_root.strip()
+    if args.future_target == "cache":
+        if not args.target_cache_root:
+            raise ValueError("--future-target cache requires --target-cache-root")
+        if not compressor_path(args.target_cache_root).exists():
+            raise ValueError(
+                f"{compressor_path(args.target_cache_root)} is missing; run "
+                f"scripts/build_future_target_cache.py --target-cache-root {args.target_cache_root} first"
+            )
+        train_phi = args.lambda_future > 0.0
+    else:
+        if args.target_cache_root:
+            raise ValueError("--target-cache-root needs --future-target cache")
+        if args.lambda_future > 0.0:
+            raise ValueError(
+                "--lambda-future > 0 needs --future-target cache; without real Teacher targets the "
+                "register would be supervised by all-zero placeholders"
+            )
+        train_phi = False
+    # A zero weight means the term is never built, so phi stays out of the graph
+    # and out of the DDP reducer rather than receiving an identically-zero gradient.
+    lambda_future = args.lambda_future if train_phi else 0.0
 
     dctx = setup_distributed()
     device = dctx.device
@@ -543,7 +756,15 @@ def main() -> int:
         raise RuntimeError(f"only {len(candidates)} scenes resolved; need >= batch_size*world ({args.batch_size * dctx.world})")
     log0(dctx, {"event": "index_built", "scenes": len(candidates), "elapsed_s": round(time.time() - index_start, 2)})
 
-    dataset = NavtrainSceneDataset(candidates, args.sensor_root, args.multigt_root, args.cache_root, args.log_root)
+    dataset = NavtrainSceneDataset(
+        candidates,
+        args.sensor_root,
+        args.multigt_root,
+        args.cache_root,
+        args.log_root,
+        target_cache_root=args.target_cache_root or None,
+        target_dim=args.target_dim,
+    )
     sampler = DistributedSampler(dataset, num_replicas=dctx.world, rank=dctx.rank, shuffle=True, drop_last=True) if dctx.enabled else None
     loader = DataLoader(
         dataset,
@@ -559,20 +780,38 @@ def main() -> int:
     )
 
     # ---- model / scorer / oracle ------------------------------------------ #
+    # Every hyperparameter here must equal Stage 1's, or --stage1-checkpoint cannot
+    # load with strict=True: LoRA rank sets the adapter shapes, target_dim the width,
+    # heads the Wan payload's num_heads (4 at hidden_dim=256, since Wan's own
+    # convention is num_heads * attn_head_dim == hidden_dim).
     model = DirectedPairDiT(
-        d_model=256,
-        heads=8,
-        ffn_dim=1024,
+        d_model=args.target_dim,
+        heads=args.heads,
+        ffn_dim=4 * args.target_dim,
         depth=args.depth,
+        num_scene_tokens=DRIVOR_NUM_SCENE_TOKENS,
         dino_checkpoint=args.dino_checkpoint,
-        dino_model_name="vit_large_patch16_dinov3.lvd1689m",
-        dino_lora_rank=16,
-        dino_lora_alpha=16.0,
-        use_all_native_tokens=args.use_all_native_tokens,
+        dino_image_hw=DRIVOR_OFFICIAL_IMAGE_HW,
+        dino_lora_rank=DRIVOR_LORA_RANK,
+        dino_grad_checkpointing=args.grad_checkpointing,
+        wan_backbone_path=args.wan_backbone if Path(args.wan_backbone).exists() else None,
     ).to(device)
     scorer = ScratchDrivoRScorer(
-        d_model=256, heads=1, ffn_dim=1024, decoder_layers=4, scene_tokens=model.scene_tokens
+        d_model=args.target_dim, heads=1, ffn_dim=4 * args.target_dim,
+        decoder_layers=4, scene_tokens=model.scene_tokens,
     ).to(device)
+    if args.wan_backbone and not Path(args.wan_backbone).exists():
+        log0(dctx, {"event": "warn", "message": f"Wan backbone {args.wan_backbone} not found; theta starts random"})
+
+    if args.stage1_checkpoint:
+        # weights_only=True: the Stage 1 payload is tensors plus a scene-id list, so
+        # nothing here needs to unpickle arbitrary Python objects.
+        stage1 = torch.load(args.stage1_checkpoint, map_location="cpu", weights_only=True)
+        model.load_state_dict(stage1["model"], strict=True)
+        log0(dctx, {"event": "stage1_restored", "checkpoint": str(args.stage1_checkpoint),
+                    "scene_ids": len(stage1.get("scene_ids", [])),
+                    "note": "eta+phi+theta restored; the scorer stays at scratch init"})
+        del stage1
 
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -585,7 +824,8 @@ def main() -> int:
         del resume_ckpt
 
     opt_generator, opt_scorer, generator_parameters, scorer_parameters = build_optimizers(
-        model, scorer, lr=args.lr, scorer_lr=args.scorer_lr, weight_decay=args.weight_decay
+        model, scorer, lr=args.lr, scorer_lr=args.scorer_lr,
+        weight_decay=args.weight_decay, train_phi=train_phi,
     )
 
     net = JointStage2Module(model, scorer).to(device)
@@ -605,9 +845,11 @@ def main() -> int:
         total_opt_steps = min(total_opt_steps, args.max_steps)
 
     trainable = {
-        "generator_eta_theta": sum(p.numel() for p in generator_parameters),
+        "generator_eta_theta_phi": sum(p.numel() for p in generator_parameters),
         "scorer_psi": sum(p.numel() for p in scorer_parameters),
-        "phi_frozen": sum(p.numel() for p in model.phi.parameters()) + model.phi_time_queries.numel(),
+        "phi_trainable": train_phi,
+        "phi_parameters": sum(p.numel() for p in model.phi.parameters()) + model.phi_time_queries.numel(),
+        "scene_blocks_frozen": sum(p.numel() for n, p in model.named_parameters() if n.startswith("scene_blocks.")),
     }
     log0(dctx, {
         "event": "setup",
@@ -620,7 +862,29 @@ def main() -> int:
         "total_opt_steps": total_opt_steps,
         "trainable": trainable,
         "scorer_contract": scorer.feature_audit,
-        "lambda_future": 0.0,
+        "wan_backbone": model.wan_backbone_info,
+        # Loss weights, with the reference each ratio comes from:
+        #   lambda_action / lambda_score = DrivoR trajectory_weight / final_score_weight = 1.0 / 1.0
+        #   lambda_rank                  = DrivoR preference_weight * preference_rank_weight = 1.0 * 0.1
+        #   lambda_velocity              = SimWAM v_loss (and FastWAM's action loss) at 1.0
+        #   dense/diversity              = DrivoR's own trajectory objective internals
+        #   lambda_future                = FastWAM ema_joint's auxiliary-term scale (0.1)
+        "loss_weights": {
+            "lambda_action": args.lambda_action,
+            "lambda_velocity": args.lambda_velocity,
+            "lambda_score": args.lambda_score,
+            "lambda_rank": args.lambda_rank,
+            "lambda_future": lambda_future,
+            "dense_weight": args.dense_weight,
+            "diversity_weight": args.diversity_weight,
+            "dense_gate_m": args.dense_gate_m,
+        },
+        "flow": {
+            "num_train_timesteps": model.flow.num_train_timesteps,
+            "shift": model.flow.scheduler.shift,
+            "inference_sigma": INFERENCE_SIGMA,
+            "action_sampling_loops": 0,
+        },
     })
 
     # ---- training loop ----------------------------------------------------- #
@@ -640,6 +904,10 @@ def main() -> int:
             size = observation.rgb_history.shape[0]
             mode_codes = modes.expand_for_batch(size, device)
             source = initializer.clean(observation.ego_history, mode_codes)
+            # One random flow timestep per scene per step, exactly as SimWAM samples
+            # it: no step1->step2->... rollout, a single forward returns a trajectory.
+            timestep = model.flow.sample_timestep((size,), device, source.dtype)
+            flow_data = gather_flow_data(source, targets["gt_trajectory"], targets["gt_valid"])
 
             factor = schedule_factor(opt_step + 1, total_opt_steps, args.warmup)
             for group in opt_generator.param_groups:
@@ -647,7 +915,9 @@ def main() -> int:
             for group in opt_scorer.param_groups:
                 group["lr"] = args.scorer_lr * factor
 
-            endpoint, trajectory, logits = net(observation, source, mode_codes)
+            endpoint, velocity, velocity_target, register, trajectory, logits = net(
+                observation, source, mode_codes, flow_data, timestep
+            )
 
             with torch.no_grad():
                 try:
@@ -657,15 +927,67 @@ def main() -> int:
                     labels, labels_ok = None, False
                 assignment = hungarian_xy(trajectory, targets["gt_trajectory"], targets["gt_valid"])
 
-            loss_action = paired_residual_velocity_mse(endpoint, source, targets["gt_encoded"], assignment)
+            # DrivoR's trajectory objective generalized to Multi-GT: the Hungarian
+            # pairs get full-weight L1 minADE, the remaining candidates get a small
+            # dense nearest-GT pull plus the anti-collapse diversity penalty.
+            trajectory_terms = multigt_trajectory_loss(
+                endpoint,
+                targets["gt_trajectory"],
+                targets["gt_valid"],
+                dense_weight=args.dense_weight,
+                diversity_weight=args.diversity_weight,
+                dense_gate_m=args.dense_gate_m,
+                assignment=assignment,
+            )
+            loss_action = trajectory_terms["loss_trajectory"]
+            # SimWAM's v_loss on the rectified-flow velocity in normalized units, so
+            # metres and radians contribute comparably and the bell weight by t applies.
+            loss_velocity = flow_velocity_loss(velocity, velocity_target, model.flow.weight(timestep))
+            if lambda_future > 0.0:
+                loss_future = dense_future_l1(register, pair_targets(targets), endpoint)
+            else:
+                loss_future = loss_action * 0.0
             if labels_ok:
-                loss_score = scorer.source_loss(logits, labels)
+                source_loss = scorer.source_loss(logits, labels)
+                if args.lambda_rank > 0.0:
+                    # DrivoR preference_module rank loss: push the scorer utility of the
+                    # oracle-best (chosen) slot above an unsafe / worst (rejected) slot.
+                    # Weighted INDEPENDENTLY of lambda_score so its effective coefficient
+                    # equals DrivoR's preference_weight(1.0)*preference_rank_weight(0.1)
+                    # = 0.1 (drivoR.yaml).  Nesting it under lambda_score diluted it 5x
+                    # (0.2*0.1=0.02), which is why sel_pdms stalled below Phase B's 0.978.
+                    # NOTE: oracle.evaluate returns CPU labels (get_sub_score runs on CPU
+                    # numpy), unlike Phase B whose labels come from the .to(device) cache.
+                    # Align every label-derived tensor to logits' device before mixing
+                    # with the CUDA gt/utility/trajectory tensors.
+                    device = logits.device
+                    gt, gt_ok = first_valid_gt(targets["gt_trajectory"], targets["gt_valid"])
+                    gt = gt.to(device)
+                    gt_ok = gt_ok.to(device)
+                    utility = aggregate_score_logits(logits.clamp(-30.0, 30.0))
+                    final_score = labels.final_score.detach().to(device)
+                    scene_ok = labels.final_valid.all(dim=1).to(device) & gt_ok
+                    with torch.no_grad():
+                        chosen, rejected, pair_valid = mine_pair(
+                            trajectory.detach(), gt, final_score, args.unsafe_threshold)
+                    pair_ok = (scene_ok & pair_valid).to(utility.dtype)
+                    margin = F.softplus(-(utility.gather(1, chosen[:, None]).squeeze(1)
+                                          - utility.gather(1, rejected[:, None]).squeeze(1)))
+                    margin = torch.nan_to_num(margin, nan=0.0, posinf=0.0, neginf=0.0)
+                    rank_loss = (margin * pair_ok).sum() / pair_ok.sum().clamp_min(1.0)
+                else:
+                    rank_loss = source_loss * 0.0
             else:
                 # Keep psi in the autograd graph (zero grad) so DDP never sees an
                 # unused parameter and ranks stay in lockstep on a failed oracle.
                 oracle_failures += 1
-                loss_score = (logits * 0.0).sum()
-            loss = args.lambda_action * loss_action + args.lambda_score * loss_score
+                source_loss = (logits * 0.0).sum()
+                rank_loss = source_loss * 0.0
+            loss = (args.lambda_action * loss_action
+                    + args.lambda_velocity * loss_velocity
+                    + args.lambda_score * source_loss
+                    + args.lambda_rank * rank_loss
+                    + lambda_future * loss_future)
 
             is_boundary = ((micro + 1) % accum) == 0
             sync_ctx = net.no_sync() if (dctx.enabled and accum > 1 and not is_boundary) else nullcontext()
@@ -689,6 +1011,7 @@ def main() -> int:
                 metrics = all_reduce_sum(metrics, dctx)
                 denom_scene = max(float(metrics[5].item()), 1.0)
                 denom_ade = max(float(metrics[4].item()), 1.0)
+                denom_near = max(float(metrics[7].item()), 1.0)
                 record = {
                     "event": "step",
                     "epoch": epoch,
@@ -696,12 +1019,20 @@ def main() -> int:
                     "total_opt_steps": total_opt_steps,
                     "lr": round(args.lr * factor, 8),
                     "loss_action": round(float(loss_action.detach()), 6),
-                    "loss_score": round(float(loss_score.detach()), 6),
+                    "loss_velocity": round(float(loss_velocity.detach()), 6),
+                    "loss_future": round(float(loss_future.detach()), 6),
+                    "loss_score": round(float(source_loss.detach()), 6),
+                    "loss_rank": round(float(rank_loss.detach()), 6),
                     "loss_total": round(float(loss.detach()), 6),
+                    "matched_ade_m": round(float(trajectory_terms["matched_ade"].detach()), 4),
+                    "dense_ade_m": round(float(trajectory_terms["dense_ade"].detach()), 4),
+                    "diversity": round(float(trajectory_terms["diversity"].detach()), 4),
+                    "flow_sigma_mean": round(float((timestep.detach() / model.flow.num_train_timesteps).mean()), 4),
                     "eval_selected_pdms": round(float(metrics[0].item()) / denom_scene, 4) if labels_ok else None,
                     "eval_oracle_best_pdms": round(float(metrics[1].item()) / denom_scene, 4) if labels_ok else None,
                     "eval_oracle_match_rate": round(float(metrics[2].item()) / denom_scene, 4) if labels_ok else None,
                     "eval_matched_gt_ade_m": round(float(metrics[3].item()) / denom_ade, 4),
+                    "eval_all64_nearest_gt_ade_m": round(float(metrics[6].item()) / denom_near, 4),
                     "oracle_failures": oracle_failures,
                     "sec_per_step": round((time.time() - run_start) / opt_step, 3),
                 }

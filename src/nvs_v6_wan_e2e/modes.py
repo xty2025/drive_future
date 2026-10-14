@@ -49,26 +49,35 @@ class ImmutableModeBuffer:
 
 
 class StructuredSourceInitializer:
-    def __init__(self, xy_scale: float = 20.0, jitter_std: float = 0.02, seed: int = 17) -> None:
-        self.xy_scale = xy_scale
+    """Small-angle unicycle rollout of each mode code, in DrivoR's metric units.
+
+    The mode code is ``(delta_speed [m/s], yaw_rate [rad/s])`` applied to the
+    current observable speed ``ego_history[:, -1, 3]`` (DrivoR's ``vx``).  The
+    output is ``[B,M,8,3]`` with ``x,y`` in metres and ``heading`` in radians --
+    no rescaling, exactly like DrivoR's ``state_size=3`` trajectory space.
+    """
+
+    def __init__(self, jitter_std: float = 0.4, heading_jitter_std: float = 0.05, seed: int = 17) -> None:
         self.jitter_std = jitter_std
+        self.heading_jitter_std = heading_jitter_std
         self.seed = seed
 
     def clean(self, ego_history: torch.Tensor, modes: torch.Tensor, steps: int = 8) -> torch.Tensor:
         if modes.ndim != 3 or modes.shape[-1] != 2:
             raise ValueError("modes must be [B,M,2]")
-        speed = ego_history[:, -1, 0].clamp_min(0.0).unsqueeze(1) if ego_history.shape[-1] else torch.zeros(modes.shape[:2], device=modes.device)
-        speed = speed + modes[..., 0]
-        speed = speed.clamp_min(0.0)
+        if ego_history.shape[-1] < 4:
+            raise ValueError("ego_history must carry DrivoR's pose3 + velocity2 + acceleration2")
+        speed = ego_history[:, -1, 3].clamp_min(0.0).unsqueeze(1)
+        speed = (speed + modes[..., 0]).clamp_min(0.0)
         yaw_rate = modes[..., 1]
         times = torch.arange(1, steps + 1, device=modes.device, dtype=modes.dtype) * 0.5
         x = speed.unsqueeze(-1) * times
-        y = 0.5 * yaw_rate.unsqueeze(-1) * times.square() * speed.unsqueeze(-1).clamp_min(1.0)
-        yaw = yaw_rate.unsqueeze(-1) * times
-        return torch.stack((x / self.xy_scale, y / self.xy_scale, yaw.sin(), yaw.cos()), dim=-1)
+        y = 0.5 * (speed * yaw_rate).unsqueeze(-1) * times.square()
+        heading = yaw_rate.unsqueeze(-1) * times
+        return torch.stack((x, y, heading), dim=-1)
 
     def noisy(self, ego_history: torch.Tensor, modes: torch.Tensor, steps: int = 8, generator: torch.Generator | None = None) -> torch.Tensor:
         clean = self.clean(ego_history, modes, steps)
-        noise = torch.randn(clean.shape, device=clean.device, dtype=clean.dtype, generator=generator) * self.jitter_std
-        noise[..., 2:] = noise[..., 2:] * 0.25
-        return clean + noise
+        noise = torch.randn(clean.shape, device=clean.device, dtype=clean.dtype, generator=generator)
+        noise[..., 2] = noise[..., 2] * (self.heading_jitter_std / max(self.jitter_std, 1e-8))
+        return clean + noise * self.jitter_std

@@ -55,9 +55,21 @@ from nvs_v6_wan_e2e.data import (  # noqa: E402
     Observation,
     drivor_observable_ego_feature,
     drivor_route_command,
-    encode_trajectory,
 )
 from nvs_v6_wan_e2e.real_data import _frame_image, _relative_pose  # noqa: E402
+
+
+def encode_trajectory(trajectory, xy_scale: float = 20.0):
+    """Trajectory -> model encoding, identical to nvs_v6_wan.data.encode_trajectory.
+
+    The e2e package dropped this public helper (PairTargets now carries raw
+    gt_trajectory and the trainer encodes internally), but the encoding
+    convention is unchanged, so mirror it here for the ADE diagnostic.
+    """
+    if trajectory.shape[-1] != 3:
+        raise ValueError("trajectory must end in x,y,yaw")
+    x, y, yaw = trajectory.unbind(-1)
+    return torch.stack((x / xy_scale, y / xy_scale, yaw.sin(), yaw.cos()), dim=-1)
 
 
 # navtest has no Multi-GT; its official metric cache lives under a nested
