@@ -13,12 +13,133 @@
 > **米制 `[x,y,heading]`，全程不 rescale**；scorer 输入全 detach → **只 detach proposals，
 > scene K/V 不 detach**（逐字照抄 DrivoR）；`endpoint = source + head(...)` 单步回归 →
 > **Wan2.2 ActionDiT 的 rectified-flow 单次前向**（σ=1 锚点先验，零 rollout）。
-> 本规范里的**用户硬约束**（R→Action 单向注意力、Multi-GT + Hungarian、在线 PDMS 打分、
+> 本规范里的**用户硬约束**（Multi-GT + Hungarian、在线 PDMS 打分、
 > 不得用未来 RGB/GT 轨迹做输入、不得把随机张量冒烟写成真实 NAVSIM 验证）全部仍然有效。
+> 「R→Action 单向注意力」这一条**已被用户于 2026-10-15 明确推翻**，见下条追加说明。
+> **⚠ 但下条说明里关于 mask 的部分随后又被推翻了**——请一路读到第二条追加说明
+> （「mask 恢复说明」）再下结论；现行实现是**两张 per-stage mask 表**。
+
+> **方向反转说明（2026-10-15 追加，不改动以下任何需求正文）。**
+> **⚠ 本条中「`GROUP_ALLOW` 已作废」「没有任何 group mask」「全双向」「Scene 只作
+> cross-attention K/V、永不进序列」「16 token」这几句已被第二条追加说明推翻，
+> 其余内容仍然有效。**
+> 用户原话：「而且你这个对齐合理吗，我想要的是你当前帧query和scene以及干净的action过dit，
+> 然后得到未来表征的query，拿这个去和未来的register做对齐，把你现在潜在的不合理的地方都改掉。
+> 可以是类似jepa那种形式，你就尽量抄类似drive-jepa那种做法也无所谓怎么合理怎么来」。
+> 因此本规范**最重要的方向**（「Action 可以读取预测 Register；Register 不能读取 Action」）
+> 与 `GROUP_ALLOW` 有向注意力掩码（第 58 行）**已作废**。现在的实现是 V-JEPA 式的：
+> Scene(81) 只作为 cross-attention 的 K/V 被 `text_embedding` 嵌入一次；DiT 序列是
+> `[Action A(8) | Future R(8)] = 16` token 的**全双向**自注意力（RoPE 覆盖 token 轴，
+> 没有任何 group mask）；`future_queries` 是 `randn(8,256)*0.02` 的可学习 query，
+> 与投影后的 clean ego 相加后接在 action token 之后；`Head` 读 `x[:, :8]` 出速度，
+> `future_head` 读 `x[:, 8:]` 出预测 register。**信息流反了：未来读 action，而不是 action 读未来。**
+> 独立的 `phi` RegisterBlock 分支（8 个 block）连同 `GROUP_ALLOW` 一起删除，
+> `parameter_groups` 只剩 `{eta, theta}`（`scene_blocks.` 归 eta）。
+> 另外，用户同时要求「未来的 token register 就不要两个压缩成一个了」，所以 register 目标从
+> 4 token（每 token 压 2 帧）改为 **8 token，每未来帧一个**（+0.5…+4.0s），
+> `ordered_quadrant_vectors` 给出 `[K,8,4096]`（4 象限 × 1024，**不做时间池化**），
+> 白化 PCA 到 `[K,8,256]`。
+> **（这两句本身已被 2026-10-15 第三次追加说明作废：目标现在是 CLS-query cosine
+> attention 读出 + 对角标准化，`[K,8,1024]`，见 §4.2。只有"不做时间池化 / 8 token
+> 每未来帧一个"这一半仍然有效。）**
+> 下文凡涉及 `phi`、`GROUP_ALLOW`、`R→A` 单向、`f_\phi`、「4 个 register token」、
+> 「每 2 帧压缩成 1 个」、「Stage1 冻结 Action」的段落
+> **均以代码为准，不要照抄**（用这些字符串 grep 本文件即可全部定位；不列行号是因为
+> 行号会随后续追加说明漂移）。仍然有效的部分：Multi-GT + Hungarian、dense + diversity 反塌缩、
+> rectified-flow 单次前向零 rollout、速度损失出轨迹、在线 PDMS 的 6 头 scorer、
+> 米制轨迹不 rescale、Stage 1 先于 Stage 2。
+
+> **mask 恢复说明（2026-10-15 第二次追加，覆盖上一条中"无 mask"的部分）。**
+> 用户原话：「停，你把 mask 那部分改回去，参照 *Future Register Attention Mask Design
+> Review* ……这部分得严格按照给你的提示做啊，**不能信息泄漏**。」
+> 因此上一条说明里「`GROUP_ALLOW` 已作废」「没有任何 group mask」「全双向」这三句
+> **本身也作废**：自注意力现在带 mask，而且是 **per-stage 两张表**
+> （`NvsActionDiT.SEGMENT_VISIBILITY`，行=query、列=key、1=可读）：
+>
+> | 阶段 | query\key | Scene | Action | Register | 学到的映射 |
+> |---|---|---|---|---|---|
+> | **Stage 1** | Scene | ✓ | ✗ | ✗ | `(Scene, Action) → Register` |
+> | | Action | ✓ | ✓ | ✗ | |
+> | | Register | ✓ | ✓ | ✓ | |
+> | **Stage 2** | Scene | ✓ | ✗ | ✗ | `(Scene, Action, Future) → Trajectory` |
+> | | Action | ✓ | ✓ | ✓ | |
+> | | Register | ✓ | ✗ | ✓ | |
+>
+> 关键点，逐条对照 design review：
+> - **Stage 1 禁止 `Register → Action`**：Register 是预测目标，打开它就等于拿未来训动作、
+>   目标泄漏进本该预测它的那条流。
+> - **Stage 2 禁止 `Action → Register`**：`R_pred` 必须是独立的 `(Scene, Mode)` 估计，
+>   而不是它即将条件化的那条轨迹的描述。
+> - **两个阶段不能用同一张表**，这正是本文件旧版内部矛盾（第 107 行的 `GROUP_ALLOW`
+>   与"R 扰动能影响 A"的测试要求互相冲突）的解法：旧版只有一张表，所以怎么写都违反其中一处。
+> - **两个阶段 Scene 都只读自己**，因为 Scene 是 scorer 的 K/V；ActionDiT 不写 Scene。
+> - **Stage 2 禁止 `R^GT → Action`，必须用 `R^pred`**（推理时没有真实未来）。实现上
+>   `R^pred` 由**冻结 EMA 副本在 stage2 mask 下**先跑一遍得到，再由 `future_fuse`
+>   cross-attend 进 **Action**（不是 Scene）。这就是 design review 的两遍式：
+>   先 `(Scene, Mode) → R^pred`，再 `(Scene, Action, R^pred) → Action`。
+> - **与 FastWAM 的方向差别**：FastWAM 的目标是"未来预测增强表征"，所以它禁止
+>   `Future → Action`；**本项目的目标恰恰是 `Future → Action`**，因为 Future Register
+>   是一个 planning condition（future-conditioned planning）。所以 design review 说的
+>   "禁止 Future→Action"只针对 **Stage 1** 和 **`R^GT` 直接进 Action**这两种情况。
+> - **bool 语义方向**：SDPA 的 `attn_mask` 里 `True = 允许`，`nn.MultiheadAttention` 的
+>   `attn_mask` 里 `True = 禁止`，与本文件 [R5] 一致。两张表的对角块都全可见，
+>   所以不存在全 `-inf` 行（第 844 行的要求）。
+>
+> 上一条说明中**仍然有效**的部分：序列是 `[Scene(81) | Action(8) | Register(8)] = 97` token
+> （Scene 现在**也进**自注意力序列，同时仍是 cross-attention 的 K/V）、8 个 register token
+> 每未来帧一个、EMA 机制、L1 是 loss、Stage 1 只训未来表征。
+> 独立的 `phi` RegisterBlock 分支仍然**已删除**——mask 现在直接作用在联合序列上，
+> 不再需要一个单独的分支来实现有向信息流。
+> `parameter_groups` 仍是 `{eta, theta}`（`scene_blocks.` 归 eta）。
+
+> **Register 目标重写说明（2026-10-15 第三次追加，覆盖前两条中所有关于"目标怎么算"的部分）。**
+> 用户原话：「`ordered_quadrant_vectors` 的 mean-pooling 提取不到信息，改为 query
+> （cross-attention）方式提取 register target；不要 PCA；保证未来不塌缩；query 处理方式
+> 参考 ActionDiT 的 `future_queries`。已量化：81% 的 GT 判别信号在空间 pattern 里，
+> 被 mean-pooling 完全销毁；ordered-2x2 相对单个全局均值只多买到 ~3% 可分性。」
+> 因此**作废**：`ordered_quadrant_vectors`、`Ordered2x2Compressor`、`[K,8,4096]`、
+> 白化 PCA、`[K,8,256]`、`compressor_hash`、`compressor_full_rank`、
+> `--allow-rank-deficient-target`、`explained_variance_ratio`、"4 象限 × 1024"、
+> 以及一切 `target_compressor` 冻结项。
+> **现行定义**（完整推导与实测数字见 §4.2）：每帧在原生 `464×832`（grid `29×52 = 1508`
+> patch）下前向，`FutureQueryExtractor` 以**该帧自己的 CLS token 为零参数 query**、
+> cosine logits、`QUERY_TEMPERATURE = 0.005`、`QUERY_HEADS = 8`、**value 不归一化**读出
+> 1024 宽；再做**对角**标准化（逐维 mean/std，`TARGET_STD_FLOOR = 1e-2`）。
+> 每 GT `[8, 1024]`，无空间分区、无时间池化。
+>
+> 由此产生一个**贯穿全文的形状变化**：register 目标宽度从此是 Teacher 自己的
+> `feature_dim = 1024`，**不再等于 `d_model = 256`**，两者是两个独立的配置量
+> （`--target-dim` 现在只表示 `d_model`，新增 `--register-target-dim`）。
+> 不能把 `hidden_dim` 直接加宽到 1024 来"对齐"：Wan payload 要求
+> `num_heads * attn_head_dim == hidden_dim`（4 × 64 == 256），动它就动不了权重迁移。
+> 所以 `future_head` 是 `Linear(hidden_dim, register_target_dim) = Linear(256, 1024)`，
+> 而 `future_fuse` 两侧宽度不对称（`kdim`/`vdim` + 两个各自的 LayerNorm，详见 §4.2 之后的
+> 架构图说明）。
+>
+> 上一条说明中**仍然有效**的部分：两张 per-stage mask 表、97-token 序列、EMA 两遍式、
+> 8 个 register token 每未来帧一个、L1 是 loss、Stage 1 只训未来表征、
+> `parameter_groups = {eta, theta}`。目标的**算法**换了，目标在架构里的**位置和数量**没换。
+>
+> 本文件下文凡出现 `compressor`、`PCA`、`白化`、`象限`、`ordered_quadrant_vectors`、
+> `[K,8,256]`、`[K,8,4096]`、`target_compressor`、`4 个 register`、`每 2 帧压 1 个`
+> 的段落，**一律以代码为准，不要照抄**（用这些字符串 grep 本文件即可全部定位）。
+> §4.2 与架构图已按新定义改写；未改写的历史段落保留原文以便追溯，
+> 但其中所有**绝对数值**（L1、`target_abs_mean`、参数量、tensor 数）都是在旧目标下测的，
+> 与新目标**不可比**——旧记录的处置见 `README.md` 的 *Measurement caveat* 与 `AGENTS.md`
+> 的口径警告。
 
 本文件是当前唯一需求基线，取代 v1、v2、v3、v3.1、v4、v5 及此前图文中互相冲突的默认设置。这里“FINAL”表示本轮架构和工程接口定稿，不表示已经在用户的 NAVSIM 数据上运行，也不表示性能/安全性已经证明。
 
-**最重要的方向：Action 可以读取预测 Register；Register 不能读取 Action。**
+**最重要的方向：分阶段。** ~~Action 可以读取预测 Register；Register 不能读取 Action。~~
+**【按 2026-10-15 第二次追加说明修正】** 这句话在 **Stage 2** 成立、在 **Stage 1** 不成立：
+
+- **Stage 1**（学未来表征）：`Action → Register` 开，`Register → Action` **关**。
+  即中间轮次说的"Future 读 Action"，因为此时 Register 是被监督的**目标**。
+- **Stage 2**（future-conditioned planning）：`Register → Action` 开，`Action → Register` **关**。
+  即本节原话，因为此时 Register 是**条件**，且必须独立于它要条件化的轨迹。
+
+两个阶段共用同一个 97-token 序列 `[Scene | Action | Register]` 和同一套权重，
+只有 mask 不同——`attention_stage` 是必填位置参数，入口与阶段 1:1 绑定。
 
 ```text
 Scene S ────────────────┐
@@ -29,6 +150,50 @@ Scene S ────────────────┐
                          ↑
                        Scene
 ```
+
+现行实现（单个联合 DiT 序列，**per-stage segment mask**）：
+
+```text
+Scene S(81) ──eta──→ scene_blocks ──text_embedding──┬──→ cross-attn K/V（整个 Scene，不屏蔽）
+                                                    └──→ 自注意力序列的第 0..80 段
+noisy/clean action ──action_encoder(+mode,+ego,+t)──→ A(8) ──┐   （第 81..88 段）
+future_queries(8, randn*0.02) + 投影后的 clean ego ──→ R(8) ─┴──→（第 89..96 段）
+                                                             ↓
+        8 × Wan block 的 self-attn，覆盖 97 token 轴，RoPE 每段从 0 重启，
+        并带 segment_attention_mask(attention_stage, [81, 8, 8])：
+          stage1 = [[S←S], [A←S,A], [R←S,A,R]]      （R→A 关）
+          stage2 = [[S←S], [A←S,A,R], [R←S,R]]      （A→R 关）
+                                          ┌──────────────────┴──────────────────┐
+                                    Head(x[:, 81:89], cond)         future_head(x[:, 89:])
+                                          ↓                            = LayerNorm(无仿射) → Linear
+                                  velocity → 米制轨迹                        ↓
+                                          ↓                          predicted register [B,M,8,1024]
+                                     Scorer(ψ)                               ↓
+                                                    与 Teacher 的 [K,8,1024] query 提取 + 对角标准化目标对齐
+```
+
+Stage 2 还有一条**绕过主干**的 `R^pred` 通道（design review 的两遍式）：冻结 EMA 副本
+先在 **stage2 mask** 下跑一遍得到 `teacher_register`，`future_fuse` 再把它
+cross-attend 进 **Action token**，学生 θ 才消费融合后的 Action。它写 Action 而不写
+Scene，因为两张表都规定 Scene 不接受修改，而 Scene 正是 scorer 的 K/V；
+它在 Stage 1 **既不跑也冻结**，因为它本身就是 `Register → Action` 这条 Stage 1 要关的箭头。
+**这条通道两侧宽度不同**，因为 register 现在是 Teacher 自己的 1024 宽而 `d_model` 是 256：
+`future_fuse` 用 `nn.MultiheadAttention(d_model, heads, kdim=register_target_dim,
+vdim=register_target_dim)`，于是 PyTorch 把 `in_proj_weight` 置为 `None`、改配
+`q_proj_weight (256,256)` / `k_proj_weight (256,1024)` / `v_proj_weight (256,1024)`
+加一条 `in_proj_bias (768,)`；LayerNorm 也必须**各一个**——
+`future_fuse_norm = LayerNorm(d_model)` 归一化 query 侧的 Action，
+`future_fuse_hint_norm = LayerNorm(register_target_dim)` 归一化 K/V 侧的 teacher register。
+共用一个 `LayerNorm(d_model)` 不是"形状不匹配、补一下就好"，而是**在错误的轴上做归一化**。
+`future_fuse*` 三个模块共 10 tensor / 658,944 参数，全部按**名字前缀**选择，
+`parameter_groups`、`_set_generator_trainability` 与契约测试用的是同一个前缀，
+所以三处不会对"fusion 包含哪些模块"产生分歧。
+
+注意：**未来 query 的输入里没有轨迹投影，也没有 mode code**——只有 `future_queries`
+加投影后的 clean ego（`wan_dit.encode_future`）。轨迹信息完全通过同一 self-attention
+里旁边的 8 个 action token 读到（**仅 Stage 1**；Stage 2 关掉了这条），所以「哪一条 GT」
+无法从行号或 code 里短路出来。
+Stage 1 跑的是 σ=0 的 clean GT 轨迹，Stage 2 跑的是加噪后的，两者共用这一条路径。
 
 真实未来 RGB / Teacher Register / GT 轨迹 / metric_cache 的未来对象都不作为自由生成或评分网络的输入。未来训练目标只在匹配与 Loss 侧使用。
 
@@ -190,7 +355,7 @@ trajectory_path / trajectory_coordinate_frame / trajectory_pose_hash
 future_rgb_paths / future_times_s / future_camera_id
 camera_calibration_hash / render_world_version
 frame_valid / chunk_valid / quality
-teacher_checkpoint_hash / compressor_hash / target_cache_path
+teacher_checkpoint_hash / target_fingerprint / target_cache_path
 ```
 
 `original_gt_id`相同的复制项只算一个GT。近重复轨迹应诊断并通过明确阈值去重；不使用k-means生成GT，不用简单copy制造多模态。
@@ -210,16 +375,22 @@ class FutureViewProvider:
 
 ### 3.4 时间和动态世界一致性
 
-未来4s按2Hz取8张：`+0.5,+1.0,...,+4.0s`。每两帧构成一个1秒bin中的两个采样点：
+未来4s按2Hz取8张：`+0.5,+1.0,...,+4.0s`。**每个未来帧一个 Register token，不做任何时间池化**：
 
-| future bin | 采样时刻 | 输出 |
+| future token | 采样时刻 | 输出 |
 |---|---|---|
-| (0,1]s | 0.5、1.0 | R[k,0] |
-| (1,2]s | 1.5、2.0 | R[k,1] |
-| (2,3]s | 2.5、3.0 | R[k,2] |
-| (3,4]s | 3.5、4.0 | R[k,3] |
+| 0 | +0.5s | R[k,0] |
+| 1 | +1.0s | R[k,1] |
+| 2 | +1.5s | R[k,2] |
+| 3 | +2.0s | R[k,3] |
+| 4 | +2.5s | R[k,4] |
+| 5 | +3.0s | R[k,5] |
+| 6 | +3.5s | R[k,6] |
+| 7 | +4.0s | R[k,7] |
 
-两张相邻图之间差0.5s；不要再写“每2秒的2帧”。
+两张相邻图之间差0.5s；不要再写“每2秒的2帧”，也不要再写“每两帧构成一个1秒bin”。
+早先的 4-token 版本把**每对**帧折进一个目标，那等于把 +0.5s 与 +1.0s 放进同一个线性
+子空间，而 +2.5…+4.0s——PDMS 真正打分的那一段——只拿到一半的监督密度。
 
 NVS若重放logged agents，PDM也需使用同一场景时间线；NVS不自动模拟其他交通主体对自车的反应。有限但危险的轨迹可以是负样本，NVS缺失/黑帧/鬼影则要mask未来目标。模型不能获得前视图不可见区域的确定性安全保证。
 
@@ -235,19 +406,76 @@ NVS若重放logged agents，PDM也需使用同一场景时间线；NVS不自动�
 - 默认不使用动态EMA。选择固定Teacher是为了静态目标可缓存及计算可控，不代表必然精度更高。
 - 动态EMA只作为另立配置的消融；不得边更新Teacher边永久使用旧特征。不得在主配置中悄悄启用。
 
-### 4.2 每GT 8帧压为4个Register
+### 4.2 每GT 8帧 → 8个Register（每未来帧一个，query 提取）
 
-1. 每帧经固定Teacher得到patch feature grid。
-2. 固定2×2空间分区pool，保留区域顺序。
-3. 每个chunk将 `[早帧四区; 晚帧四区]`按顺序拼接，不作无序两帧均值。
-4. 只在train split拟合PCA/固定线性压缩至d=256，冻结均值、投影、归一化并保存hash。
-5. 每个chunk一个向量，最终每GT `[4,256]`；两个帧都有效才默认启用该chunk目标。
+1. 每帧经固定 Teacher 在**原生 `464×832`** 下前向，得到 CLS token 与 patch grid。
+   两条边都能被 16 整除 → grid `29×52 = 1508` patch。**不做任何 resize 或插值**，
+   尺寸不对直接抛错；DINOv3 的 RoPE 按轴归一化坐标，所以跨 grid 尺寸可比性本来就成立，
+   插值只会白付代价。
+2. `FutureQueryExtractor` 读出该帧的一个向量：以**这一帧自己的 CLS token 为 query**，
+   对 patch grid 算 **cosine** 相似度 logits，除以 `QUERY_TEMPERATURE = 0.005`，
+   按 `view(B, L, H, Dh).transpose(1, 2)` 切成 `QUERY_HEADS = 8` 个头
+   （即头 *h* 拿连续切片 `[h*Dh, (h+1)*Dh)`，与 `wan_dit.CrossAttention._split` 同一约定），
+   每头 softmax 后加权求和 value，再拼回 1024 宽。
+   **value 不做归一化**：把每个 patch 缩到单位长度会丢掉目标本该携带的幅值。
+3. **没有任何空间分区，也没有任何时间池化**：一帧一个 token，`+0.5…+4.0s` 各自独立。
+4. 只在 **train split** 拟合**对角**标准化（逐维 mean/std），每个 std 下限
+   `TARGET_STD_FLOOR = 1e-2 × max(std)`，命中下限的维数记进 `clamped_components`，
+   审计而不静默。保存 `standardizer.pt` 与其 `fingerprint()`。
+5. 每 GT 最终 `[8, 1024]`；帧无效则该帧目标不启用。
 
-压缩器也是目标定义的一部分；更新压缩器必须重建cache。小样本烟测不够拟合PCA时可用固定种子的测试投影，但必须标为 `synthetic_smoke_only`，正式训练不混用。
+**为什么用 query 而不是空间池化。** 真实 Teacher 特征上的 two-way ANOVA 把 **81.0%** 的
+GT 判别方差放在 GT-specific 的**空间 pattern** 里，只有 19.0% 在 per-GT 的平均水平上
+（逐 scene：75.1 / 87.1 / 80.1 / 82.3%）。mean-pooling 直接销毁那 81%；
+ordered 2×2 象限只比单个全局均值多买到 **~3%** 的相对可分性，宽度却是 4 倍。
 
-4个Register是用户指定预算，不是信息充分性保证。PCA可能丢失罕见风险线索，需有4/16 tokens与空间分区的容量消融。时间embedding加到查询中，而不是把时间编码作为主要重建目标制造低Loss假象。
+**为什么 query 是零参数的。** 可学习的 extractor 会在 Student 追目标的同时**移动目标**。
+实测：随机初始化的可学习 query 的注意力熵是 `log2(P)` 的 **0.999997** —— 一个穿着
+attention 外衣的 mean pool。`MAX_QUERY_ATTENTION_ENTROPY = 0.5` 就是拦这个的门禁，
+依据是实测间隔（选择性 readout ≤ 0.436，退化的 ≥ 0.936），不是拍的。
 
-DINO自带register、历史压缩memory、本项目4个未来Register是三个不同概念。
+**为什么 τ = 0.005。** 可分性**单独不是充分统计量**：随机 query 对照的可分性是
+0.4957，**高于** CLS query 的 0.4934，但轨迹相关只有 0.4121 对 CLS 的 0.6647。
+高比值既可能是"保住了轨迹信号"，也可能是"把 scene 扔进噪声里"。原始**点积** softmax
+（不做 cosine）实测熵 0.9987、可分性 0.1414，**比它要替换的池化还差** —— DINOv3 特征
+强各向异性，一个共享均值方向主导每个乘积。0.005 是选定的折中点，**不是拐点**：
+
+| τ | 注意力熵（/log2 P） | 可分性 | 轨迹相关 |
+|---|---|---|---|
+| 0.10 | 0.936 | —（低于它替换掉的池化） | — |
+| 0.02 | 0.436 | 0.3593 | 0.7184 |
+| 0.01 | 0.320 | 0.4498 | 0.7032 |
+| **0.005** | **0.098** | **0.5091** | **0.6890** ← 选定 |
+| 0.003 | 0.055 | 0.5357 | 0.6816 |
+
+参照量：`full_patch`（不读出的上界）可分性 0.3903 / 相关 0.7578；象限均值可分性 0.1730；
+CLS 本身相关 0.6647；`within_scene_gt_distance = 67.6`。语料 103075 scene，19% 退化。
+
+**为什么对角标准化而不是 PCA。** PCA 的秩是 `min(target_dim, fit_rows)`，
+**秩之外的维逐位为 0**，对应的 scale 是 1.0，所以那一段目标恒为零。4 scene 拟合时
+rank 128/256，一半目标是零，于是"输出全零"这个平凡解直接拿到 `L1 = mean|target|`
+（实测 **0.335**，比 20 步真训练的 **0.353** 还好），L1 会稳定下降而模型什么都没学。
+对角 mean/std 没有子空间、因此**没有秩**，`compressor_full_rank` 与
+`--allow-rank-deficient-target` 整类门禁随之作废；拟合 scene 数从此只影响
+**估计精度**，不再决定目标是否退化。
+标准化本身仍然必要：raw DINOv3 坐标上的 L1 几乎全是最高方差的维，而那些是 **scene 级**
+而非 **轨迹级** 的，损失会把容量花在 Scene token 已经提供的部分上 —— 这正是实测到的
+Stage 1 失败模式（轨迹盲的 per-scene-mean 记忆器拿到 0.5839，训练后的 register 只有
+0.7515）。逐维拉平让损失对轨迹判别方向给出可比的权重。它是**损失加权**选择而不是
+信息保持选择，所以标准化之后要**重新测**可分性比值与轨迹距离相关并审计。
+
+standardizer 也是目标定义的一部分：`fingerprint()`
+（= `sha256(feature_dim | temperature | heads | mean.tobytes() | scale.tobytes())`）
+变了就必须重建 cache，每个 payload 也带自己的 `target_fingerprint` 供比对。
+早先"小样本烟测不够拟合 PCA 时用固定种子的测试投影、标为 `synthetic_smoke_only`"
+这一条**作废**：对角标准化不需要拟合一个基，任何 scene 数都给出一个良定义的
+（只是精度不同的）目标。
+
+8 个 Register 是用户指定预算，不是信息充分性保证。容量消融的对象现在是 **τ 与 head 数**，
+不再是空间分区（已无空间分区）与 4/16 token 数。时间 embedding 加到查询中，
+而不是把时间编码作为主要重建目标制造低 Loss 假象。
+
+DINO 自带 register、历史压缩 memory、本项目 8 个未来 Register 是三个不同概念。
 
 ---
 
@@ -611,7 +839,7 @@ PDMScorer有可变内部状态；worker进程隔离或串行保护，不让多�
 
 ### 11.1 离线准备，不算第三训练阶段
 
-审计环境、split与metric_cache；验证GT/future一一对应；构建固定模式U和source原型规则；按固定Teacher生成4×K的目标Register缓存；fit PCA仅train；建立feature/oracle版本哈希。
+审计环境、split与metric_cache；验证GT/future一一对应；构建固定模式U和source原型规则；按固定Teacher生成8×K的目标Register缓存（每帧 CLS-query cosine attention 读出，审计 `query_attention_entropy_{mean,max,rows}` 并对 `MAX_QUERY_ATTENTION_ENTROPY` 做门禁）；对角标准化仅fit train（审计 `standardizer_fit_rows` / `standardizer_fit_scenes` / `standardizer_clamped_components` / `standardizer_fingerprint`）；建立feature/oracle版本哈希。
 
 ### 11.2 Stage1：模式条件化的未来表征预训练
 
@@ -863,14 +1091,22 @@ future_target:
   source: precomputed_front_rgb
   camera: front
   times_s: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
-  chunks: [[0.5, 1.0], [1.5, 2.0], [2.5, 3.0], [3.5, 4.0]]
-  registers_per_chunk: 1
-  registers_per_gt: 4
+  temporal_pooling: none_one_register_per_future_frame
+  registers_per_frame: 1
+  registers_per_gt: 8
   max_unique_gt: 4
   teacher: fixed_frozen_dinov3
   teacher_checkpoint: null
-  target_dim: 256
-  compression: ordered_2x2_spatial_pool_then_train_only_frozen_pca
+  teacher_image_hw: [464, 832]
+  teacher_grid_hw: [29, 52]
+  teacher_resize_filter: none_native_resolution_no_interpolation
+  spatial_readout: cls_query_cosine_attention_over_patch_grid
+  query_temperature: 0.005
+  query_heads: 8
+  max_query_attention_entropy: 0.5
+  register_target_dim: 1024
+  compression: cls_query_cosine_attention_then_train_only_frozen_diagonal_standardization
+  target_std_floor: 0.01
   target_cache_root: null
   online_nvs: false
   teacher_targets_as_model_inputs: false
@@ -972,7 +1208,14 @@ stage1:
   assignment: unique_hungarian_clean_anchor_xy_l1
   loss: matched_future_l1
   train: [student_lora, history_ego_fusion, scene_blocks, register_branch]
-  freeze: [dino_base, teacher, target_compressor, action_branch, scorer]
+  # target_standardizer 不是 nn.Module、不含任何可训练参数（它只是一次性拟合的
+  # mean/scale 张量），列在这里表达的是"训练中不得移动"，实现上它根本不进
+  # parameter_groups。velocity_head = theta.head.*（Stage 1 的损失不读它，而它
+  # 近零的锚点保持初始化必须原样活到 Stage 2）；future_fuse = future_fuse* 三个
+  # 模块，按名字前缀匹配，因为它本身就是 Stage 1 要关掉的那条 Register → Action
+  # 箭头，冻结是为了让它诚实地 gradless，而不是 trainable-but-unused（后者是
+  # find_unused_parameters=False 下 DDP reducer 拒绝的状态）。
+  freeze: [dino_base, teacher, target_standardizer, velocity_head, future_fuse, ema_theta, scorer]
   online_oracle: false
   epochs_start: 50
 stage2:
@@ -984,8 +1227,13 @@ stage2:
   loss_action: matched_residual_velocity_mse
   loss_future: matched_future_l1
   loss_score: original_drivor_score_loss_all64
-  train: [student_lora, history_ego_fusion, scene_blocks, action_branch, register_branch, scorer]
-  freeze: [dino_base, teacher, target_compressor]
+  train: [student_lora, history_ego_fusion, scene_blocks, action_branch, register_branch, future_fuse, scorer]
+  # 条件项：--future-target none（即没有 standardizer.pt 可读）时，register_branch
+  # 与 future_fuse 从 train 移到 freeze —— 8 个 register token 仍然留在序列里
+  # （主干是在 97 token 上成形的，抽掉 8 个等于评测一个 Stage 1 从没见过的序列），
+  # 但 lambda_future=0 意味着不构建未来梯度，所以必须 requires_grad=False 才能
+  # 把 future_head 挡在 DDP reducer 之外。
+  freeze: [dino_base, teacher, target_standardizer, ema_theta]
   online_oracle: true
   epochs_start: 50
 loss:
@@ -1108,13 +1356,23 @@ Scorer未来CA有非零梯度或shuffle后输出改变只证明“使用了输�
 ```text
 configs/{v6_base,v6_stage1,v6_stage2_online}.yaml
 src/data/{observation_adapter,pair_targets,future_provider,pair_manifest}.py
-src/teacher/{fixed_dinov3,ordered_compressor,target_cache}.py
+src/teacher/{fixed_dinov3,target_standardizer,target_cache}.py
 src/models/{scene_lora,immutable_modes,directed_pair_dit,paired_future_scorer}.py
 src/training/{hungarian,paired_losses,stage1,stage2,freeze_rules}.py
 src/oracle/{drivor_adapter,workers,named_targets}.py
 src/eval/{navsim_agent,selection_metrics,profiling}.py
 reports/{repository_audit,data_audit,migration_plan,contract_tests,navsim_results}.md
 ```
+
+实际落地没有采用上面这套多目录布局，而是一个扁平包 `src/nvs_v6_wan_e2e/`：
+`teacher.py`（固定 DINOv3 Teacher + `FutureQueryExtractor` + `TargetStandardizer`，
+即上面 `fixed_dinov3` 与 `target_standardizer` 两项的合体，`ordered_compressor`
+已随象限池化一起删除）、`target_cache.py`、`model.py`（`DirectedPairDiT`）、
+`wan_dit.py` / `wan_init.py`（`NvsActionDiT` 与 226-key Wan2.2 权重迁移）、
+`scorer.py`、`stages.py`（`parameter_groups` 与 `_set_generator_trainability`）、
+`losses.py`、`flow.py`、`modes.py`（`ImmutableModeBuffer`）、`vision.py` / `lora.py` /
+`dino_tokens.py`、`config.py`（strict loader）、`data.py` / `multiview_data.py` /
+`real_data.py` / `native_drivor.py` / `oracle.py` / `selection.py`。
 
 审计旧代码中这些易残留键/符号：
 

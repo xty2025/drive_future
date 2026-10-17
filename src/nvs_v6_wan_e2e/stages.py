@@ -9,6 +9,7 @@ would only drift from it.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -44,8 +45,14 @@ def _set_generator_trainability(model: DirectedPairDiT, stage: int) -> None:
     if hasattr(student, "backbone"):
         freeze_backbone_keep_lora(student.backbone)
     if stage == 1:
-        for parameter in model.theta.parameters():
-            parameter.requires_grad_(False)
+        # The future queries live inside theta now, so Stage 1 trains the DiT
+        # trunk rather than freezing it.  The velocity head is the one thing Stage 1
+        # freezes: nothing in the Stage 1 loss reads it, and leaving it trainable
+        # would put its near-zero anchor-preserving initialization at the mercy of
+        # whatever optimizer replaces AdamW (which skips grad-less parameters).
+        for name, parameter in model.theta.named_parameters():
+            if name.startswith("head."):
+                parameter.requires_grad_(False)
 
 
 def _set_scorer_trainability(scorer: ScratchDrivoRScorer, enabled: bool) -> None:
@@ -57,8 +64,7 @@ def build_optimizers(model: DirectedPairDiT, scorer: ScratchDrivoRScorer, stage:
     _set_generator_trainability(model, stage)
     _set_scorer_trainability(scorer, stage == 2)
     groups = parameter_groups(model)
-    generator_groups = [groups["eta"], groups["phi"]] if stage == 1 else [groups["eta"], groups["theta"], groups["phi"]]
-    generator_parameters = [parameter for group in generator_groups for parameter in group]
+    generator_parameters = [parameter for group in groups.values() for parameter in group]
     # Keep a complete scorer optimizer in both stages.  Stage 1 parameters are
     # frozen and therefore have no gradients; Stage 2 enables this exact set.
     scorer_parameters = list(scorer.parameters())
@@ -75,6 +81,21 @@ def build_optimizers(model: DirectedPairDiT, scorer: ScratchDrivoRScorer, stage:
     return torch.optim.AdamW(generator_parameters, lr=lr), torch.optim.AdamW(scorer_parameters, lr=scorer_lr)
 
 
+def schedule_factor(step: int, total: int, warmup: int) -> float:
+    """Linear warmup then cosine decay to 5% of base LR.
+
+    Shared by both DDP trainers so a ``--lr`` on a command line means the same curve
+    in Stage 1 and Stage 2.  ``step`` is 1-based: the first optimizer step runs at
+    ``1 / warmup`` of the base rate rather than at zero, which is what keeps a warm
+    start from taking a full-size AdamW update on an unestimated second moment.
+    """
+
+    if warmup > 0 and step <= warmup:
+        return max(step, 1) / warmup
+    progress = (step - warmup) / max(1, total - warmup)
+    return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, progress))))
+
+
 def stage1_step(
     observation: Observation,
     targets: PairTargets,
@@ -83,23 +104,29 @@ def stage1_step(
 ) -> Stage1Result:
     """Trajectory-conditioned future representation training.
 
-    The register is conditioned on each scene's own GT trajectories, so the row
-    pairing is the identity and no anchor codebook or Hungarian assignment takes
-    part: row ``k`` must predict the compressed future of GT ``k``.  ``modes`` is
-    deliberately not passed, because a mode code constant per row index would let
-    the network identify the GT from its row alone and skip the trajectory.
+    The future queries are conditioned on each scene's own GT trajectories, so the
+    row pairing is the identity and no anchor codebook or Hungarian assignment
+    takes part: row ``k`` must predict the compressed future of GT ``k``.  The
+    mode code is *zeroed* rather than per-row, because a code constant per row
+    index would let the network identify the GT from its row alone and skip the
+    trajectory.
 
     The input is noise-free by construction: ``forward_register_only`` runs the
     clean trajectory, which is the ``sigma = 0`` end of the same flow Stage 2
-    noises.  Only ``phi`` learns here -- ``theta`` is frozen by
-    ``_set_generator_trainability(model, 1)``.
+    noises.  Everything except the velocity head learns here -- which is exactly
+    "train the future representation": no action-generation objective is optimized
+    in this stage.  The single segment mask applies, so the register reads the
+    clean action while the action cannot read the register back; that is the same
+    information flow Stage 2 and the deployed path run, which is what makes
+    ``loss_future`` comparable across stages.
     """
 
     model.train()
     _set_generator_trainability(model, stage=1)
     optimizer.zero_grad(set_to_none=True)
     source = targets.gt_trajectory
-    predicted_register = model.forward_register_only(observation, source)
+    modes = torch.zeros((*source.shape[:2], 2), device=source.device, dtype=source.dtype)
+    predicted_register = model.forward_register_only(observation, source, modes)
     loss_future = identity_future_l1(predicted_register, targets)
     loss_future.backward()
     optimizer.step()

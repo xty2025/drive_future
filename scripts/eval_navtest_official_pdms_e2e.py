@@ -240,6 +240,10 @@ def main() -> int:
         "depth": meta["depth"],
         "heads": meta["heads"],
         "target_dim": meta["target_dim"],
+        # Recorded separately because it is no longer ``target_dim``: the future head
+        # emits the Teacher's feature width, and a checkpoint loaded at the wrong one
+        # is a different model, not a differently-named same one.
+        "register_target_dim": meta["register_target_dim"],
         "scene_tokens": int(model.scene_tokens),
         "split": "navtest (held-out)",
         "scoring": "official navsim pdm_score path (official MetricCache + official PDMScorer)",

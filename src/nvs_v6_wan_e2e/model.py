@@ -1,16 +1,17 @@
 """NAVSIM v6-wan generator: DrivoR scene perception + Wan2.2 Action DiT.
 
-Three streams keep the v6 directed contract ``GROUP_ALLOW = ((1,0,0),(1,1,1),(1,0,1))``:
+Two streams, and the future representation is an *auxiliary output* of the second
+one -- never an input to it:
 
 * ``eta`` -- DrivoR's scene perception (DINOv3 with prepended scene queries and
   q/v LoRA, see :mod:`nvs_v6_wan_e2e.vision`) plus DrivoR's ``hist_encoding``
-  ego token, fused by ``scene_blocks``.
-* ``phi`` -- the Future Register, reading ``[S, R]`` per layer and initialised
-  from the metric source trajectory, so one scene yields a different future per
-  candidate trajectory.
+  ego token, refined by ``scene_blocks`` into the 81 Scene tokens.
 * ``theta`` -- SimWAM's Wan2.2 ActionDiT at ``hidden_dim=256``
-  (:mod:`nvs_v6_wan_e2e.wan_dit`), reading ``[S, A, sg(R)]`` in Wan's
-  self+cross split.
+  (:mod:`nvs_v6_wan_e2e.wan_dit`) over the single 121-token sequence
+  ``[scene(81) | action(8) | register(32)]``.  Wan's head reads the eight action
+  tokens as the rectified-flow velocity; ``future_head`` reads the thirty-two
+  register tokens -- four DINOv3 prefix-query readouts per future frame -- as the
+  predicted future.
 
 Trajectories are DrivoR-native metric ``[x, y, heading]`` in metres and radians
 with no rescaling.  The Action DiT is a rectified-flow model over them
@@ -20,10 +21,50 @@ inference time.  ``sigma = 0`` makes the flow state the clean action (Stage 1);
 ``sigma = 1`` makes it the anchor prior, which is what
 :meth:`DirectedPairDiT.forward_pairs` deploys.
 
-The Register consumes the trajectory as an *initialisation feature*, never as an
-attention key: ``GROUP_ALLOW`` still forbids ``R<-A``, and Scene is still never
-updated by Action or Register.  Action and Register therefore share the same
-flow state as an input while remaining separate streams.
+Direction of information flow
+-----------------------------
+The three segments sit in one sequence under **one mask**, identical for every
+stage and every entry point (see
+:attr:`nvs_v6_wan_e2e.wan_dit.NvsActionDiT.SEGMENT_VISIBILITY`):
+
+=================  ======  ======  ========
+query \\ key        Scene   Action  Register
+=================  ======  ======  ========
+Scene              yes     no      no
+Action             yes     yes     no
+Register           yes     yes     yes
+=================  ======  ======  ========
+
+**Action never reads Register.**  That is a structural invariant rather than a
+training choice: the predicted future cannot reach the velocity head through the
+shared trunk, and this module deliberately provides no channel around it either.
+An earlier revision had one -- ``future_fuse``, which cross-attended an EMA copy of
+``theta``'s register into the action tokens during Stage 2 -- and it was removed
+precisely because it *was* a ``Register -> Action`` bypass of the mask the contract
+exists to enforce.  It had a second, independent defect: the register segment
+receives no mode code (:meth:`nvs_v6_wan_e2e.wan_dit.NvsActionDiT.encode_future`),
+so its output was identical across all candidates of a scene and the fusion could
+not have ranked them.
+
+What is left is a pure auxiliary readout.  The register is supervised by the cached
+Teacher target and its gradient flows into the block stack the action stream shares,
+so predicting the future still *shapes* the generator -- V-JEPA's predictor shaping
+its encoder -- without conditioning a single emitted waypoint.  That is a weaker
+coupling than future-conditioned planning, and it is the honest description of what
+this model does.
+
+``Action -> Register`` staying open is what keeps the register non-trivial: since
+``encode_future`` supplies neither trajectory nor mode, closing it would leave the
+register a function of ``(Scene, ego)`` alone and therefore **bitwise identical
+across the K Multi-GT rows of one scene**, pinning ``paired_future_l1`` at the
+``scene_mean_target_l1`` floor and forcing ``gain_over_trajectory_blind`` to exactly
+zero on every step.
+
+Scene reads only itself, so the ActionDiT never writes to the tokens DrivoR's
+scorer takes as K/V; ``PairOutputs.scene_context`` is exactly eta's refined Scene.
+No GT ever enters the sequence -- the register slots start as ``future_queries``
+plus the RMS-clamped ego encoding, and the cached Teacher target is only ever
+compared against ``future_head``'s output.
 """
 
 from __future__ import annotations
@@ -34,6 +75,7 @@ from typing import Iterator, Sequence
 import torch
 from torch import nn
 
+from .config import EXPECTED_REGISTER_TARGET_DIM, EXPECTED_REGISTER_TOKENS
 from .data import Observation
 from .flow import INFERENCE_SIGMA, ActionFlow
 from .vision import (
@@ -47,26 +89,10 @@ from .vision import (
 from .wan_dit import NvsActionDiT
 from .wan_init import load_action_dit_backbone
 
-GROUP_ALLOW = ((1, 0, 0), (1, 1, 1), (1, 0, 1))
-
 # DrivoR's observable ego vector: pose3, velocity2, acceleration2, command4.
 EGO_OBSERVABLE_DIM = 11
 EGO_STATUS_DIM = 7
 TRAJECTORY_STATE_DIM = 3
-
-
-def build_group_mask(ns: int, na: int, nr: int, device: torch.device | None = None) -> torch.Tensor:
-    sizes = (ns, na, nr)
-    mask = torch.zeros(sum(sizes), sum(sizes), dtype=torch.bool, device=device)
-    row_start = 0
-    for row, row_size in enumerate(sizes):
-        col_start = 0
-        for col, col_size in enumerate(sizes):
-            if GROUP_ALLOW[row][col]:
-                mask[row_start : row_start + row_size, col_start : col_start + col_size] = True
-            col_start += col_size
-        row_start += row_size
-    return mask
 
 
 @dataclass
@@ -74,7 +100,10 @@ class PairOutputs:
     scene_context: torch.Tensor
     endpoint: torch.Tensor
     trajectory: torch.Tensor
-    predicted_register: torch.Tensor
+    #: ``None`` when the model was built with ``predict_future=False``, i.e. when
+    #: no Teacher target cache exists and the future tokens are left out of the
+    #: DiT sequence altogether.
+    predicted_register: torch.Tensor | None
 
 
 @dataclass
@@ -152,6 +181,7 @@ class SceneEncoder(nn.Module):
         dino_image_hw: Sequence[int] = DRIVOR_OFFICIAL_IMAGE_HW,
         dino_lora_rank: int = DRIVOR_LORA_RANK,
         dino_grad_checkpointing: bool = False,
+        dino_vision_bf16: bool = False,
     ) -> None:
         super().__init__()
         self.frames = frames
@@ -168,6 +198,7 @@ class SceneEncoder(nn.Module):
                 lora_rank=dino_lora_rank,
                 output_dim=d_model,
                 grad_checkpointing=dino_grad_checkpointing,
+                vision_bf16=dino_vision_bf16,
             )
             if dino_checkpoint
             else SpatialStudent(d_model, num_frames=self.frame_axis, num_scene_tokens=num_scene_tokens)
@@ -246,25 +277,6 @@ class SceneBlock(nn.Module):
         return scene + self.ffn(self.norm_ffn(scene))
 
 
-class RegisterBlock(nn.Module):
-    def __init__(self, d_model: int, heads: int, ffn_dim: int) -> None:
-        super().__init__()
-        self.norm_attn = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, heads, batch_first=True)
-        self.norm_ffn = nn.LayerNorm(d_model)
-        self.ffn = FeedForward(d_model, ffn_dim)
-
-    def forward(self, register: torch.Tensor, scene: torch.Tensor) -> torch.Tensor:
-        b, m, nr, d = register.shape
-        scene = scene.unsqueeze(1).expand(-1, m, -1, -1).reshape(b * m, scene.shape[1], d)
-        register = register.reshape(b * m, nr, d)
-        query = self.norm_attn(register)
-        key_value = torch.cat((scene, register), dim=1)
-        register = register + self.attn(query, key_value, key_value, need_weights=False)[0]
-        register = register + self.ffn(self.norm_ffn(register))
-        return register.reshape(b, m, nr, d)
-
-
 class DirectedPairDiT(nn.Module):
     def __init__(
         self,
@@ -273,7 +285,10 @@ class DirectedPairDiT(nn.Module):
         ffn_dim: int = 1024,
         depth: int = 8,
         action_tokens: int = 8,
-        register_tokens: int = 4,
+        register_tokens: int = EXPECTED_REGISTER_TOKENS,
+        #: The future head's output width = the Teacher's own feature width, not the
+        #: ``d_model`` above; the two were one parameter before the query readout.
+        register_target_dim: int = EXPECTED_REGISTER_TARGET_DIM,
         frames: int = 5,
         views: int = 1,
         num_scene_tokens: int = DRIVOR_NUM_SCENE_TOKENS,
@@ -282,10 +297,12 @@ class DirectedPairDiT(nn.Module):
         dino_image_hw: Sequence[int] = DRIVOR_OFFICIAL_IMAGE_HW,
         dino_lora_rank: int = DRIVOR_LORA_RANK,
         dino_grad_checkpointing: bool = False,
+        dino_vision_bf16: bool = False,
         wan_backbone_path: str | None = None,
         attn_head_dim: int = 64,
         freq_dim: int = 256,
         eps: float = 1e-6,
+        predict_future: bool = True,
     ) -> None:
         super().__init__()
         if d_model % heads:
@@ -296,6 +313,11 @@ class DirectedPairDiT(nn.Module):
         self.action_tokens = action_tokens
         self.register_tokens = register_tokens
         self.depth = depth
+        #: ``False`` drops the future tokens from the DiT sequence entirely, which
+        #: is what a joint run does when no Teacher target cache exists.  The
+        #: parameters stay allocated so a Stage 1 checkpoint still loads; callers
+        #: freeze them, and :meth:`_flow_pass` then returns ``register=None``.
+        self.predict_future = predict_future
         self.eta = SceneEncoder(
             d_model,
             frames=frames,
@@ -306,27 +328,9 @@ class DirectedPairDiT(nn.Module):
             dino_image_hw=dino_image_hw,
             dino_lora_rank=dino_lora_rank,
             dino_grad_checkpointing=dino_grad_checkpointing,
+            dino_vision_bf16=dino_vision_bf16,
         )
         self.scene_tokens = self.eta.scene_tokens
-        self.phi = nn.ModuleDict(
-            {
-                "mode_projection": nn.Linear(2, d_model),
-                # The metric trajectory is what makes one candidate's future
-                # differ from another's inside the same scene: 8 poses x [x,y,heading].
-                "trajectory_projection": nn.Linear(action_tokens * TRAJECTORY_STATE_DIM, d_model),
-                "blocks": nn.ModuleList([RegisterBlock(d_model, heads, ffn_dim) for _ in range(depth)]),
-            }
-        )
-        self.phi_time_queries = nn.Parameter(torch.randn(register_tokens, d_model) * 0.02)
-        # The trajectory arrives in metres, so its coordinates reach ~60 while the
-        # compressed targets sit near 1.  A default-initialised projection therefore
-        # starts the register ~5x larger than anything it has to predict, and the
-        # first steps only undo that.  Zeroing it makes the trajectory a residual the
-        # branch grows into, which leaves the anchor-only initialisation exactly as
-        # it was and still passes gradient: the input is non-zero, so both weight and
-        # bias receive one from step 0.
-        nn.init.zeros_(self.phi["trajectory_projection"].weight)
-        nn.init.zeros_(self.phi["trajectory_projection"].bias)
         self.theta = NvsActionDiT(
             hidden_dim=d_model,
             action_dim=TRAJECTORY_STATE_DIM,
@@ -338,6 +342,8 @@ class DirectedPairDiT(nn.Module):
             attn_head_dim=attn_head_dim,
             num_layers=depth,
             action_tokens=action_tokens,
+            future_tokens=register_tokens,
+            target_dim=register_target_dim,
             mode_dim=2,
             ego_dim=d_model,
         )
@@ -348,7 +354,6 @@ class DirectedPairDiT(nn.Module):
             self.wan_backbone_info["loaded"] = True
             self.wan_backbone_path = str(wan_backbone_path)
         self.scene_blocks = nn.ModuleList([SceneBlock(d_model, heads, ffn_dim) for _ in range(depth)])
-        self.register_readout = nn.Identity()
         # Stateless schedule, not an nn.Module on purpose: it must contribute no
         # Parameter that parameter_groups()/the Wan payload key check would see.
         self.flow = ActionFlow()
@@ -356,58 +361,27 @@ class DirectedPairDiT(nn.Module):
     def token_layout(self) -> dict[str, object]:
         return self.eta.token_layout()
 
-    def _initialize_register(self, modes: torch.Tensor | None, source: torch.Tensor) -> torch.Tensor:
-        """``R0 = time_queries + projected_trajectory [+ projected_mode_code]``.
+    def _refine_scene(self, scene: torch.Tensor) -> torch.Tensor:
+        for block in self.scene_blocks:
+            scene = block(scene)
+        return scene
 
-        ``modes=None`` drops the mode term.  Stage 1 trains one register per GT
-        trajectory, so a mode code that is constant per row index would let the
-        network answer "which GT is this" from the row alone and never read the
-        trajectory -- the exact failure the anchor-only Stage 1 had.
+    def forward_register_only(self, observation: Observation, source: torch.Tensor, modes: torch.Tensor) -> torch.Tensor:
+        """Stage 1: the clean action at ``sigma = 0``, read back through the future head.
+
+        ``modes`` must be a *zero* code, not ``None``: ``encode_action`` and
+        ``encode_condition`` require ``[B,M,2]``, and a code that is constant per
+        row index would let the network answer "which GT is this" from the row
+        alone and never read the trajectory -- the exact failure the anchor-only
+        Stage 1 had.  Zeros carry no row information, so the shortcut is
+        structurally unavailable and both stages share one code path.
         """
-
-        if source.ndim != 4 or source.shape[-2:] != (self.action_tokens, TRAJECTORY_STATE_DIM):
-            raise ValueError(f"source must be [B,M,{self.action_tokens},{TRAJECTORY_STATE_DIM}] in metres")
-        b, m = source.shape[0], source.shape[1]
-        if modes is not None and modes.shape[:2] != (b, m):
-            raise ValueError("modes must align with source on [B,M]")
-        query = self.phi_time_queries.view(1, 1, self.register_tokens, self.d_model)
-        register = query.expand(b, m, -1, -1) + self.phi["trajectory_projection"](source.flatten(-2)).unsqueeze(2)
-        if modes is not None:
-            register = register + self.phi["mode_projection"](modes).unsqueeze(2)
+        if not self.predict_future:
+            raise ValueError("forward_register_only needs a model built with predict_future=True")
+        timestep = torch.zeros(source.shape[0], device=source.device, dtype=source.dtype)
+        _, register, _ = self._flow_pass(observation, source, modes, timestep)
+        assert register is not None
         return register
-
-    def _directed_pass(
-        self,
-        scene: torch.Tensor,
-        action: torch.Tensor | None,
-        register: torch.Tensor,
-        condition: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        b, m, nr, d = register.shape
-        ns = scene.shape[1]
-        raw_contexts: list[torch.Tensor] = []
-        for scene_block, register_block in zip(self.scene_blocks, self.phi["blocks"]):
-            scene = scene_block(scene)
-            register = register_block(register, scene)
-            if action is not None:
-                scene_flat = scene.unsqueeze(1).expand(b, m, ns, d).reshape(b * m, ns, d)
-                register_flat = self.register_readout(register).detach().reshape(b * m, nr, d)
-                raw_contexts.append(torch.cat((scene_flat, register_flat), dim=1))
-        if action is None:
-            return scene, register, None
-        # Wan embeds the cross-attention context once in `pre_dit`; NVS's Action
-        # stream reads the Register at every layer, so each layer gets its own.
-        contexts = [self.theta.text_embedding(context) for context in raw_contexts]
-        flat_condition = condition.reshape(b * m, d)
-        velocity = self.theta(action.reshape(b * m, self.action_tokens, d), flat_condition, contexts)
-        return scene, register, velocity.reshape(b, m, self.action_tokens, -1)
-
-    def forward_register_only(self, observation: Observation, source: torch.Tensor, modes: torch.Tensor | None = None) -> torch.Tensor:
-        clean_ego = self.eta.encode_clean_ego(observation)
-        scene = self.eta(observation, clean_ego=clean_ego)
-        register = self._initialize_register(modes, source)
-        _, register, _ = self._directed_pass(scene, None, register)
-        return self.register_readout(register)
 
     def _flow_pass(
         self,
@@ -415,18 +389,38 @@ class DirectedPairDiT(nn.Module):
         noisy_action: torch.Tensor,
         modes: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Shared trunk: encode ``x_sigma`` and return ``(scene, register, velocity)``."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Shared trunk: run the DiT once and return ``(scene, register, velocity)``.
+
+        One call, one mask, for all three public entry points -- there is no stage
+        argument to get wrong, because the information flow no longer depends on
+        which objective is being computed.  ``register`` is ``None`` when
+        ``predict_future`` is off.
+
+        The register reads the action segment beside it and the action cannot read
+        back, so ``(Scene, Action) -> Future`` holds identically in Stage 1 and in
+        Stage 2 and ``loss_future`` measures the same function in both.  The future
+        therefore never conditions the velocity: it is an auxiliary head whose
+        gradient shapes the block stack the action stream shares and nothing more.
+
+        The returned ``scene`` is eta's refined Scene, untouched by the DiT: Scene
+        reads only itself.  That is what keeps the scorer's K/V exactly DrivoR's.
+        """
         clean_ego = self.eta.encode_clean_ego(observation)
-        scene = self.eta(observation, clean_ego=clean_ego)
+        scene = self._refine_scene(self.eta(observation, clean_ego=clean_ego))
+        b, m = noisy_action.shape[:2]
         action = self.theta.encode_action(noisy_action, modes, clean_ego)
+        future = self.theta.encode_future(action, clean_ego) if self.predict_future else None
         condition = self.theta.encode_condition(modes, clean_ego, timestep)
-        # The Register is conditioned on the same flow state the Action stream
-        # sees, so Stage 1 (sigma=0) reads the clean GT trajectory and Stage 2
-        # reads the noised one -- never a clean answer the DiT has to rediscover.
-        register = self._initialize_register(modes, noisy_action)
-        scene, register, velocity = self._directed_pass(scene, action, register, condition)
-        return scene, self.register_readout(register), velocity
+        ns, d = scene.shape[1], self.d_model
+        context = scene.unsqueeze(1).expand(b, m, ns, d).reshape(b * m, ns, d)
+        velocity, register = self.theta(
+            action.reshape(b * m, self.action_tokens, d),
+            None if future is None else future.reshape(b * m, self.register_tokens, d),
+            condition.reshape(b * m, d),
+            context,
+        )
+        return scene, None if register is None else register.reshape(b, m, self.register_tokens, -1), velocity.reshape(b, m, self.action_tokens, -1)
 
     def forward_pairs(self, observation: Observation, source: torch.Tensor, modes: torch.Tensor) -> PairOutputs:
         """Deployed inference: one forward at ``sigma = 1``, no rollout.
@@ -488,7 +482,7 @@ class DirectedPairDiT(nn.Module):
 
 
 def parameter_groups(model: DirectedPairDiT) -> dict[str, list[nn.Parameter]]:
-    groups = {"eta": [], "theta": [], "phi": []}
+    groups = {"eta": [], "theta": []}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
@@ -496,26 +490,21 @@ def parameter_groups(model: DirectedPairDiT) -> dict[str, list[nn.Parameter]]:
             groups["eta"].append(parameter)
         elif name.startswith("theta."):
             groups["theta"].append(parameter)
-        elif name.startswith("phi.") or name == "phi_time_queries":
-            groups["phi"].append(parameter)
         else:
-            raise ValueError(f"parameter `{name}` is not assigned to an eta/theta/phi group")
+            raise ValueError(f"parameter `{name}` is not assigned to an eta/theta group")
     return groups
 
 
 __all__ = [
     "EGO_OBSERVABLE_DIM",
     "EGO_STATUS_DIM",
-    "GROUP_ALLOW",
     "TRAJECTORY_STATE_DIM",
     "DirectedPairDiT",
     "FlowOutputs",
     "PairOutputs",
-    "RegisterBlock",
     "SceneBlock",
     "SceneEncoder",
     "SpatialStudent",
-    "build_group_mask",
     "freeze_backbone_keep_lora",
     "parameter_groups",
 ]

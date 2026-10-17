@@ -25,9 +25,12 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .config import EXPECTED_REGISTER_TARGET_DIM
 from .data import (
     Observation,
     PairTargets,
+    REGISTER_QUERIES_PER_FRAME,
+    REGISTER_TOKENS,
     drivor_observable_ego_feature,
     drivor_route_command,
 )
@@ -47,6 +50,16 @@ DEFAULT_CACHE_ROOT = (
 )
 DENSE_FRAMES = 41
 FUTURE_POSE_INDICES = tuple(range(5, DENSE_FRAMES, 5))
+# Every decoded future frame is read by ``REGISTER_QUERIES_PER_FRAME`` of DINOv3's
+# prefix queries, so the Teacher's frame list times that count must equal the target's
+# register axis.  Checking it here rather than in ``validate`` is what stops a
+# ``DENSE_FRAMES`` edit from silently producing targets that no longer line up with the
+# eight poses.
+if len(FUTURE_POSE_INDICES) * REGISTER_QUERIES_PER_FRAME != REGISTER_TOKENS:
+    raise ValueError(
+        f"{len(FUTURE_POSE_INDICES)} future frames x {REGISTER_QUERIES_PER_FRAME} queries "
+        f"cannot fill {REGISTER_TOKENS} register targets"
+    )
 HISTORY_FRAMES = 5
 MAX_GT = 4
 
@@ -200,7 +213,7 @@ def load_multiview_sample(
     image_hw: tuple[int, int] = DRIVOR_OFFICIAL_IMAGE_HW,
     future_image_hw: tuple[int, int] | None = None,
     camera: str = "CAM_F0",
-    target_dim: int = 256,
+    register_target_dim: int = EXPECTED_REGISTER_TARGET_DIM,
     load_future_rgb: bool = True,
     log_frames: list[dict[str, Any]] | None = None,
 ) -> MultiViewSample:
@@ -213,6 +226,14 @@ def load_multiview_sample(
     ``future_image_hw=None`` leaves the generated frames at their native 464x832,
     which patch16 tiles exactly (29x52), so the Teacher target is built from
     rendered pixels with no resampling in either direction.
+
+    ``register_target_dim`` sizes only the ``future_register`` *placeholder*: the
+    Teacher has not been constructed yet at this point, and the real target is
+    attached later by :func:`with_future_register`.  Its width is the Teacher's
+    ``feature_dim`` -- DINOv3-large's 1024 -- and is deliberately **not**
+    ``d_model`` (256).  The default is the constant :func:`load_v6_config` checks
+    the yaml's ``future_target.register_target_dim`` against, so the placeholder,
+    the config and the future head cannot drift apart.
 
     ``log_frames`` lets a caller reuse an already unpickled NAVSIM log, which is
     what makes multi-sample batches cheap (the log is shared by a whole scene).
@@ -322,12 +343,12 @@ def load_multiview_sample(
     targets = PairTargets(
         gt_trajectory=gt_trajectory.unsqueeze(0),
         gt_valid=torch.ones(1, gt_count, dtype=torch.bool),
-        future_register=torch.zeros(1, gt_count, len(FUTURE_POSE_INDICES) // 2, target_dim),
-        future_chunk_valid=torch.ones(1, gt_count, len(FUTURE_POSE_INDICES) // 2, dtype=torch.bool),
-        future_quality=torch.ones(1, gt_count, len(FUTURE_POSE_INDICES) // 2),
+        future_register=torch.zeros(1, gt_count, REGISTER_TOKENS, register_target_dim),
+        future_chunk_valid=torch.ones(1, gt_count, REGISTER_TOKENS, dtype=torch.bool),
+        future_quality=torch.ones(1, gt_count, REGISTER_TOKENS),
         pair_ids=[pair_ids],
     )
-    targets.validate(max_gt=MAX_GT, registers=len(FUTURE_POSE_INDICES) // 2)
+    targets.validate(max_gt=MAX_GT, registers=REGISTER_TOKENS)
 
     cache_path = metric_cache_path(scene_dir, Path(cache_root))
     if not cache_path.exists():
@@ -386,12 +407,23 @@ def with_future_register(
     future_register: torch.Tensor,
     future_quality: torch.Tensor | None = None,
 ) -> PairTargets:
-    """Attach Teacher-compressed future targets, keeping every other field intact."""
+    """Attach the query-extracted, standardized Teacher target, keeping every other field intact.
+
+    The comparison covers the width too, so a placeholder allocated at the wrong
+    ``register_target_dim`` fails here rather than as an unexplained broadcast inside
+    the future loss; when it is only the width that differs the message says which
+    side to fix, since both shapes are otherwise just numbers.
+    """
 
     if future_register.shape != targets.future_register.shape:
-        raise ValueError(
-            f"future register target must be {tuple(targets.future_register.shape)}, got {tuple(future_register.shape)}"
+        expected, got = tuple(targets.future_register.shape), tuple(future_register.shape)
+        hint = (
+            ""
+            if expected[-1] == got[-1]
+            else "; the last axis is the Teacher's feature_dim, so the placeholder was allocated by "
+            f"load_multiview_sample(register_target_dim={expected[-1]})"
         )
+        raise ValueError(f"future register target must be {expected}, got {got}{hint}")
     quality = targets.future_quality if future_quality is None else future_quality
     if quality.shape != targets.future_quality.shape:
         raise ValueError("future quality must match the register target shape")

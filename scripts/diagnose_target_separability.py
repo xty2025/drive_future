@@ -9,11 +9,18 @@ that number and they need completely different fixes:
 2. the *target* cannot tell them apart -- no architecture change can help.
 
 This separates them without training anything.  For each scene it Teacher-encodes
-every GT's own `future.mp4`, and reports the L1 distance between two GTs' targets
-inside one scene against the L1 distance between two different scenes, once in the
-raw 4x4096 ordered-quadrant space and once after the 256-dim PCA the trainer fits.
-If PCA retains the across-scene distance but destroys the within-scene one, the
-compressor is discarding exactly the signal Stage 1 is supposed to learn.
+every GT's own `future.mp4` and reduces each frame with the same CLS-query
+attention the cache builder uses, then reports the L1 distance between two GTs'
+targets inside one scene against the L1 distance between two different scenes,
+once in the raw 8x1024 query space and once after the per-dimension
+standardization the trainer fits.  If standardization retains the across-scene
+distance but destroys the within-scene one, it is discarding exactly the signal
+Stage 1 is supposed to learn.
+
+Two further numbers are reported because a distance ratio on its own is not a
+sufficient statistic: the readout's normalized attention entropy (a uniform
+attention *is* the mean pool this target replaced, and every distance below stays
+finite), and the correlation between target distance and GT trajectory ADE.
 
 Run with the repository's standard PYTHONPATH::
 
@@ -28,6 +35,7 @@ import argparse
 import gc
 import itertools
 import json
+import math
 import pickle
 from pathlib import Path
 
@@ -42,54 +50,25 @@ from nvs_v6_wan_e2e.multiview_data import (
     load_multiview_sample,
 )
 from nvs_v6_wan_e2e.teacher import (
+    MAX_QUERY_ATTENTION_ENTROPY,
     NATIVE_FUTURE_IMAGE_HW,
-    Ordered2x2Compressor,
+    QUERY_HEADS,
+    QUERY_TEMPERATURE,
+    FutureQueryExtractor,
+    TargetStandardizer,
     TimmDinoV3Teacher,
-    ordered_quadrant_vectors,
+    measure_target_quality,
+    query_future_register,
 )
 from nvs_v6_wan_e2e.vision import DRIVOR_OFFICIAL_IMAGE_HW
 
 DEFAULT_DINO_CHECKPOINT = "/mnt/LLM_weight/timm/vit_large_patch16_dinov3.lvd1689m/model.safetensors"
 
-# Reference numbers from the two real Stage 1 runs that motivated this script:
-# artifacts/stage1_zerointerp (44 scenes, 400 steps) and
-# artifacts/stage1_multiview_aligned (20 scenes, 120 steps).
-OBSERVED = {
-    "stage1_zerointerp": {"paired_future_l1": 0.4461728883907199, "shuffled_pair_l1": 0.4478922775015235},
-    "stage1_multiview_aligned": {"paired_future_l1": 0.34815371222794056, "shuffled_pair_l1": 0.3496891111135483},
-}
-
 
 def _l1(left: torch.Tensor, right: torch.Tensor) -> float:
-    """Same convention as `paired_future_l1`: mean over features, then mean over chunks."""
+    """The ``mean_paired_future_l1`` metric convention: mean over features, then frames."""
 
     return float((left - right).abs().mean(dim=-1).mean())
-
-
-def _scene_block(
-    teacher: TimmDinoV3Teacher,
-    sample,
-    device: torch.device,
-) -> torch.Tensor:
-    """One scene's ordered quadrant vectors, `[K, 4, 4D]`, on CPU.
-
-    The patch grids are reduced as they are produced and never retained: a grid is
-    50 MB float32 while its ordered vectors are a few hundred KB, and this script
-    walks many scenes on a 50 GB machine.
-    """
-
-    future_rgb = sample.future_rgb
-    if future_rgb is None:
-        raise ValueError(f"{sample.scene_id}: future RGB must be loaded")
-    per_gt = []
-    for gt_index in range(future_rgb.shape[1]):
-        images = future_rgb[:, gt_index].to(device)
-        grid = teacher(images).float().cpu()
-        per_gt.append(ordered_quadrant_vectors(grid)[0])
-        del grid, images
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return torch.stack(per_gt, dim=0)
 
 
 def _pairwise(blocks: list[torch.Tensor]) -> dict[str, object]:
@@ -137,7 +116,10 @@ def main() -> int:
     parser.add_argument("--dino-checkpoint", default=DEFAULT_DINO_CHECKPOINT)
     parser.add_argument("--image-hw", type=int, nargs=2, default=list(DRIVOR_OFFICIAL_IMAGE_HW))
     parser.add_argument("--teacher-image-hw", type=int, nargs=2, default=list(NATIVE_FUTURE_IMAGE_HW))
-    parser.add_argument("--target-dim", type=int, default=256)
+    parser.add_argument("--query-temperature", type=float, default=QUERY_TEMPERATURE,
+                        help="cosine temperature of the CLS query; lower is more selective")
+    parser.add_argument("--query-heads", type=int, default=QUERY_HEADS,
+                        help="independent query readouts concatenated into the target")
     parser.add_argument("--skip-degenerate", action="store_true", default=True)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--output", default="artifacts/diagnose_target_separability.json")
@@ -161,11 +143,14 @@ def main() -> int:
 
     log_cache: dict[str, list[dict]] = {}
     blocks: list[torch.Tensor] = []
+    trajectories: list[torch.Tensor] = []
     scene_ids: list[str] = []
     gt_counts: list[int] = []
+    entropies: list[torch.Tensor] = []
     traj_within: list[float] = []
     skipped: list[dict[str, str]] = []
     teacher = TimmDinoV3Teacher(checkpoint=args.dino_checkpoint, image_hw=tuple(args.teacher_image_hw)).to(device)
+    extractor = FutureQueryExtractor(teacher.feature_dim, args.query_temperature, args.query_heads)
     for scene_dir in scene_dirs:
         if len(blocks) >= args.scenes:
             break
@@ -191,10 +176,16 @@ def main() -> int:
             skipped.append({"scene": scene_dir.name, "reason": "degenerate_multi_gt"})
             continue
 
-        block = _scene_block(teacher, sample, device)
+        future_rgb = sample.future_rgb
+        if future_rgb is None:
+            skipped.append({"scene": scene_dir.name, "reason": "future_rgb_not_loaded"})
+            continue
+        block, block_entropies = query_future_register(teacher, extractor, future_rgb, device)
         blocks.append(block)
+        entropies.append(block_entropies)
         scene_ids.append(sample.scene_id)
         gt_counts.append(int(sample.targets.gt_trajectory.shape[1]))
+        trajectories.append(sample.targets.gt_trajectory[0].cpu())
         # The trajectory-side separation, for contrast: how far apart the GT
         # trajectories themselves are, in metres of ADE.
         gt = sample.targets.gt_trajectory[0]
@@ -204,7 +195,11 @@ def main() -> int:
         sample.future_rgb = None
         del sample
         gc.collect()
-        print(json.dumps({"stage": "encode", "scene": scene_ids[-1], "gt": gt_counts[-1], "block": list(blocks[-1].shape)}), flush=True)
+        print(json.dumps({"stage": "encode", "scene": scene_ids[-1], "gt": gt_counts[-1],
+                          "block": list(blocks[-1].shape),
+                          "attention_entropy": round(float(block_entropies.mean()), 4)}), flush=True)
+    grid_hw = teacher.grid_hw
+    feature_dim = teacher.feature_dim
     del teacher
     gc.collect()
     if device.type == "cuda":
@@ -212,49 +207,62 @@ def main() -> int:
     if len(blocks) < 2:
         raise RuntimeError(f"need at least two scenes, got {len(blocks)}; skipped={skipped[:5]}")
 
+    all_entropies = torch.cat(entropies, dim=0)
+    entropy_mean = float(all_entropies.mean())
     raw = _pairwise(blocks)
 
-    # Exactly what the trainer feeds `Ordered2x2Compressor.fit`: every GT's ordered
-    # vectors concatenated, so the SVD rows are (GT, chunk) pairs pooled over scenes.
+    # Exactly what the builder feeds `TargetStandardizer.fit`: every GT's query
+    # vectors pooled, so each dimension's mean/std is estimated over (scene, GT,
+    # frame) rows rather than over the scenes alone.
     fit_rows = torch.cat(blocks, dim=0)
-    compressor = Ordered2x2Compressor(output_dim=args.target_dim)
-    compressor.fit(fit_rows, source_hash="+".join(scene_ids), split="train")
-    compressed_blocks = [compressor.transform_ordered(block) for block in blocks]
-    compressed_metrics = _pairwise(compressed_blocks)
+    standardizer = TargetStandardizer(feature_dim, args.query_temperature, args.query_heads)
+    standardizer.fit(fit_rows, source_hash="+".join(scene_ids), split="train")
+    standardized_blocks = [standardizer.transform(block) for block in blocks]
+    standardized_metrics = _pairwise(standardized_blocks)
+    quality = measure_target_quality(standardized_blocks, trajectories)
 
     raw_within = raw["within_scene_across_gt"]["mean"]
-    comp_within = compressed_metrics["within_scene_across_gt"]["mean"]
+    std_within = standardized_metrics["within_scene_across_gt"]["mean"]
     raw_across = raw["across_scene"]["mean"]
-    comp_across = compressed_metrics["across_scene"]["mean"]
+    std_across = standardized_metrics["across_scene"]["mean"]
 
+    retention_within = std_within / raw_within if raw_within else float("nan")
+    retention_across = std_across / raw_across if raw_across else float("nan")
     verdict = {
         "raw_within_scene_gt_l1": raw_within,
-        "compressed_within_scene_gt_l1": comp_within,
+        "standardized_within_scene_gt_l1": std_within,
         "raw_across_scene_l1": raw_across,
-        "compressed_across_scene_l1": comp_across,
-        # What a mean-future predictor would score, and what the shuffle control
-        # can therefore possibly return.  If a model predicts the scene's average
-        # future, its paired and shuffled errors both sit near half the within-scene
-        # GT distance, so the achievable shuffle gain is bounded by that distance
-        # relative to the error level the real runs actually reached.
-        "within_gt_over_observed_paired": {
-            name: comp_within / value["paired_future_l1"] for name, value in OBSERVED.items()
-        },
-        "pca_retention_within_scene_gt": comp_within / raw_within if raw_within else float("nan"),
-        "pca_retention_across_scene": comp_across / raw_across if raw_across else float("nan"),
+        "standardized_across_scene_l1": std_across,
+        "standardization_retention_within_scene_gt": retention_within,
+        "standardization_retention_across_scene": retention_across,
+        "query_attention_entropy_mean": entropy_mean,
+        "query_attention_entropy_max": float(all_entropies.max()),
+        "query_attention_entropy_ceiling": MAX_QUERY_ATTENTION_ENTROPY,
+        "separation_ratio": quality["separation_ratio"],
+        "trajectory_distance_pearson": quality["trajectory_distance_pearson"],
+        "trajectory_distance_spearman": quality["trajectory_distance_spearman"],
         "gt_trajectory_within_scene_ade_m": (
             float(torch.tensor(traj_within).mean()) if traj_within else float("nan")
         ),
     }
-    # A retention ratio far below 1 for within-scene while across-scene stays near
-    # 1 is the compressor discarding the trajectory signal specifically.
-    verdict["pca_destroys_within_scene_signal"] = bool(
-        verdict["pca_retention_within_scene_gt"] < 0.5 * verdict["pca_retention_across_scene"]
+    # A retention ratio far below 1 for within-scene while across-scene stays near 1
+    # is the standardizer reweighting away the trajectory signal specifically.  It
+    # cannot zero a dimension the way the PCA projector it replaced did, so this is
+    # now a loss-weighting concern rather than a dead-target one.
+    verdict["standardization_destroys_within_scene_signal"] = bool(
+        retention_within < 0.5 * retention_across
     )
-    # If two GTs' compressed targets are within a few percent of the error level the
-    # trainer already reached, there is no headroom for any model.
-    verdict["target_has_no_headroom"] = bool(
-        max(verdict["within_gt_over_observed_paired"].values()) < 0.05
+    # Uniform attention makes the readout the mean pool it replaced: every distance
+    # above stays finite and 81% of the GT-discriminating variance is gone.  This is
+    # the same gate the cache builder refuses to persist past.
+    verdict["query_is_a_mean_pool"] = bool(entropy_mean > MAX_QUERY_ATTENTION_ENTROPY)
+    # Separation alone is not sufficient: the random-query control matched the CLS
+    # query's ratio (0.4957 against 0.4934) while correlating only 0.4121 with
+    # trajectory ADE against the CLS query's 0.6647.  Both numbers have to be read;
+    # see ``measure_target_quality``.
+    pearson = quality["trajectory_distance_pearson"]
+    verdict["target_carries_trajectory_signal"] = bool(
+        not math.isnan(pearson) and pearson > 0.5
     )
 
     summary = {
@@ -263,13 +271,15 @@ def main() -> int:
         "gt_counts": gt_counts,
         "skipped": skipped[:20],
         "teacher_image_hw": [int(v) for v in args.teacher_image_hw],
-        "ordered_vector_dim": int(blocks[0].shape[-1]),
-        "target_dim": args.target_dim,
-        "compressor_fit_rows": int(fit_rows.shape[0] * fit_rows.shape[1]),
-        "compressor_rank": int(min(args.target_dim, fit_rows.shape[0] * fit_rows.shape[1])),
+        "teacher_grid_hw": [int(grid_hw[0]), int(grid_hw[1])],
+        "query_temperature": float(args.query_temperature),
+        "query_heads": int(args.query_heads),
+        "register_target_dim": int(blocks[0].shape[-1]),
+        "standardizer_fit_rows": int(fit_rows.shape[0] * fit_rows.shape[1]),
+        "standardizer_clamped_components": int(standardizer.state.clamped_components),
+        "target_fingerprint": standardizer.fingerprint(),
         "raw_space": raw,
-        "compressed_space": compressed_metrics,
-        "observed_stage1_reference": OBSERVED,
+        "standardized_space": standardized_metrics,
         "verdict": verdict,
     }
     output = Path(args.output)
@@ -277,7 +287,7 @@ def main() -> int:
     output.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({"stage": "verdict", **verdict}, indent=2), flush=True)
     print(json.dumps({"stage": "raw_space", **raw}, indent=2), flush=True)
-    print(json.dumps({"stage": "compressed_space", **compressed_metrics}, indent=2), flush=True)
+    print(json.dumps({"stage": "standardized_space", **standardized_metrics}, indent=2), flush=True)
     print(f"wrote {output}", flush=True)
     return 0
 

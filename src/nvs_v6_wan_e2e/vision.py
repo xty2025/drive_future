@@ -23,39 +23,49 @@ k untouched, ``w_A`` kaiming(a=sqrt(5)), ``w_B`` zeros, base frozen.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Sequence
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 DINOV3_MODEL_NAME = "vit_large_patch16_dinov3.lvd1689m"
 # DrivoR's official `image_size: [1148, 672]` (W, H) was chosen for patch14
-# DINOv2, where 1148 = 14 * 82 exactly.  DINOv3 is patch16 and timm's PatchEmbed
-# rejects that width outright:
-#   AssertionError: Input width (1148) should be divisible by patch size (16).
-# So DrivoR's resized pixels are kept byte-for-byte at 1148 and the 12 px
-# remainder is closed with four ZERO columns.  Zero padding synthesizes no pixel
-# value, which is the difference from interpolating the width up to 1152.  The
-# pad is applied here rather than through timm's `dynamic_img_pad`, because that
-# flag leaves `patch_embed.grid_size` at floor(1148/16)=71 while the padded
-# forward emits 72 columns, and the resulting mismatch crashes `forward_features`.
+# DINOv2, where 1148 = 14 * 82 exactly.  DINOv3 is patch16, so that width leaves a
+# 12 px remainder.  DrivoR's own methodology for reaching a backbone resolution is
+# to resize the image to it (its loader calls ``im.resize``) and to adapt the
+# *position encoding* to the resulting patch grid -- ``timm_ViT._pos_embed`` runs
+# ``resample_abs_pos_embed`` over the pretrained table.  This port does the same
+# two things: the width is resampled up to 1152 and the position encoding is built
+# for the 42x72 grid.  For DINOv3 the second half is exact rather than
+# interpolated, because timm implements it as ``timm.models.eva.Eva`` with
+# ``RotaryEmbeddingDinoV3`` and **no** absolute ``pos_embed`` table at all:
+# ``rope.get_embed(shape=(H', W'))`` evaluates the rotary phases analytically at
+# the target grid's normalised coordinates, which is the same operation as
+# inserting encodings between the pretrained ones, without a table to resample.
+# What this port deliberately does *not* do is close the remainder with zero
+# columns: padding the image fabricates patch content, while resampling only
+# re-sits real pixels on a grid the position encoding is then built for.
 DRIVOR_OFFICIAL_IMAGE_HW = (672, 1148)
 DRIVOR_PATCH_SIZE = 16
-DRIVOR_RIGHT_ZERO_PAD_PX = 4
-# What the backbone is actually built for: DrivoR's size after the zero pad.  Pass
-# DRIVOR_OFFICIAL_IMAGE_HW to loaders and to the Student; this one only describes
-# the padded tensor the patch embedding receives.
+DRIVOR_WIDTH_RESAMPLE_PX = 4
+# What the backbone is actually built for: DrivoR's size after the width resample.
+# Pass DRIVOR_OFFICIAL_IMAGE_HW to loaders and to the Student; this one only
+# describes the tensor the patch embedding receives.
 DRIVOR_IMAGE_HW = (672, 1152)
 DRIVOR_NUM_SCENE_TOKENS = 16
 DRIVOR_LORA_RANK = 32
 
 
 def pad_to_patch_multiple(images: torch.Tensor, patch: int = DRIVOR_PATCH_SIZE) -> torch.Tensor:
-    """Zero-pad the right/bottom edge so a DrivoR-sized frame reaches patch16.
+    """Zero-pad the right/bottom edge so a frame reaches a patch16 multiple.
 
-    ``F.pad`` appends zeros; it never resamples, so the 1148 columns produced by
-    DrivoR's own resize pass through unchanged and the four extra columns carry no
-    fabricated image content.
+    Kept for the Teacher, whose native 464x832 already tiles exactly and for which
+    this is therefore a no-op -- the assertion that the future readout never pads
+    is worth more than the dead code path it would take to prove it.  The Student
+    must use :func:`resample_to_patch_multiple` instead: zero columns would put
+    fabricated patch content into the scene encoder.
     """
 
     if images.ndim != 4:
@@ -66,6 +76,25 @@ def pad_to_patch_multiple(images: torch.Tensor, patch: int = DRIVOR_PATCH_SIZE) 
     if pad_w == 0 and pad_h == 0:
         return images
     return torch.nn.functional.pad(images, (0, pad_w, 0, pad_h))
+
+
+def resample_to_patch_multiple(images: torch.Tensor, size: Sequence[int], patch: int = DRIVOR_PATCH_SIZE) -> torch.Tensor:
+    """Bicubic-resample ``[B,3,H,W]`` to ``size``, which must tile exactly under ``patch``.
+
+    This is DrivoR's own move -- its loader resizes every frame to the backbone's
+    native size -- applied to the 12 px that DrivoR's patch14 width leaves over
+    under patch16.  Normalisation is affine per channel, so resampling after it is
+    the same operation as resampling the pixels and then normalising.
+    """
+
+    if images.ndim != 4:
+        raise ValueError(f"expected [B,3,H,W] images, got shape {tuple(images.shape)}")
+    height, width = int(size[0]), int(size[1])
+    if height % patch or width % patch:
+        raise ValueError(f"target size {size} does not tile under patch {patch}")
+    if tuple(int(value) for value in images.shape[-2:]) == (height, width):
+        return images
+    return torch.nn.functional.interpolate(images, size=(height, width), mode="bicubic", align_corners=False)
 
 
 class LoRAQKVtimm(nn.Module):
@@ -147,6 +176,7 @@ class DrivoRDinoV3Student(nn.Module):
         lora_rank: int = DRIVOR_LORA_RANK,
         output_dim: int = 256,
         grad_checkpointing: bool = False,
+        vision_bf16: bool = False,
     ) -> None:
         super().__init__()
         try:
@@ -158,12 +188,13 @@ class DrivoRDinoV3Student(nn.Module):
         height, width = int(image_hw[0]), int(image_hw[1])
         self.drivor_image_hw = (height, width)
         # DrivoR's official 1148 width is 14*82 for its patch14 DINOv2 but leaves a
-        # 12 px remainder under patch16.  Close it with zero columns rather than by
-        # resampling the width up to 1152: DrivoR's own pixels then reach the
-        # backbone byte-for-byte and the extra four columns invent nothing.
-        self.right_zero_pad_px = (-width) % DRIVOR_PATCH_SIZE
-        self.bottom_zero_pad_px = (-height) % DRIVOR_PATCH_SIZE
-        self.image_hw = (height + self.bottom_zero_pad_px, width + self.right_zero_pad_px)
+        # 12 px remainder under patch16.  Close it by resampling the width up to
+        # 1152, as DrivoR's loader resizes to its backbone size, and let the rotary
+        # position encoding be built for the resulting grid -- never by zero
+        # columns, which would feed fabricated patches to the backbone.
+        self.right_resample_px = (-width) % DRIVOR_PATCH_SIZE
+        self.bottom_resample_px = (-height) % DRIVOR_PATCH_SIZE
+        self.image_hw = (height + self.bottom_resample_px, width + self.right_resample_px)
         self.backbone = timm.create_model(
             model_name,
             pretrained=False,
@@ -203,8 +234,14 @@ class DrivoRDinoV3Student(nn.Module):
             self.lora_rank = 0
         freeze_backbone_keep_lora(self.backbone)
         self._widen_rope_prefix()
-        if grad_checkpointing:
+        self.grad_checkpointing = bool(grad_checkpointing)
+        if self.grad_checkpointing:
             self.backbone.set_grad_checkpointing(True)
+        # bf16 autocast for the frozen DINOv3 trunk only (the O(tokens^2) attention
+        # over ~3k patch tokens x 5 frames dominates the joint step).  The scene
+        # output is cast back to fp32, so neck/theta/psi/trajectory/losses are
+        # numerically untouched.  enabled=False makes this a pure no-op.
+        self.vision_bf16 = bool(vision_bf16)
         self.train(True)
 
     def _widen_rope_prefix(self) -> None:
@@ -234,8 +271,11 @@ class DrivoRDinoV3Student(nn.Module):
         return {
             "drivor_image_hw": list(self.drivor_image_hw),
             "image_hw": list(self.image_hw),
-            "right_zero_pad_px": self.right_zero_pad_px,
-            "bottom_zero_pad_px": self.bottom_zero_pad_px,
+            "right_resample_px": self.right_resample_px,
+            "bottom_resample_px": self.bottom_resample_px,
+            "right_zero_pad_px": 0,
+            "bottom_zero_pad_px": 0,
+            "student_resampling": "bicubic_to_patch_multiple",
             "patch_size": DRIVOR_PATCH_SIZE,
             "patch_grid": [int(grid[0]), int(grid[1])],
             "native_prefix_tokens": self.num_prefix_tokens,
@@ -246,32 +286,48 @@ class DrivoRDinoV3Student(nn.Module):
             "output_tokens": self.num_frames * self.num_scene_tokens,
             "position_encoding": "dinov3_rope_analytic_no_interpolation",
             "lora_rank": self.lora_rank,
+            "grad_checkpointing": self.grad_checkpointing,
         }
 
     def _prepare(self, images: torch.Tensor) -> torch.Tensor:
-        """Normalize DrivoR-style, then zero-pad the edge to a patch16 multiple.
+        """Normalize DrivoR-style, then resample the edge remainder to patch16.
 
-        DrivoR resizes 1920x1080 to its official 1148x672 and stops there.  Padding
-        happens *after* normalization so the added columns are exactly 0.0 in
-        normalized space -- the dataset mean colour -- instead of a hard black edge
-        that would read as out-of-distribution content.  Resampling is refused
-        outright: silently interpolating to the padded size is how fabricated pixels
-        end up in a scene encoder.
+        DrivoR resizes 1920x1080 to its official 1148x672 and stops there, which
+        patch16 cannot tile.  The remainder is closed by resampling to the size the
+        backbone was built for -- DrivoR's own methodology, its loader resizes every
+        frame to the backbone resolution -- while the rotary position encoding is
+        then built analytically for that grid.  Zero columns are refused: they would
+        put fabricated patch content into the scene encoder, which is precisely the
+        failure the position-encoding-level adaptation exists to avoid.  The resample
+        is *not* a general resize: it only closes the patch16 remainder, so an input
+        at any other size is still an error rather than a silent stretch.
         """
 
         height, width = self.drivor_image_hw
         if tuple(int(value) for value in images.shape[-2:]) != (height, width):
             raise ValueError(
-                f"the scene encoder does not resample: expected DrivoR's {height}x{width} frames, "
-                f"got {int(images.shape[-2])}x{int(images.shape[-1])}. Apply DrivoR's own "
-                "`im.resize((1148, 672))` in the loader instead."
+                f"the scene encoder only resamples the patch16 remainder: expected DrivoR's "
+                f"{height}x{width} frames, got {int(images.shape[-2])}x{int(images.shape[-1])}. "
+                "Apply DrivoR's own `im.resize((1148, 672))` in the loader instead."
             )
         channels_last = images.permute(0, 2, 3, 1)
         normalized = (channels_last - self.mean) / self.std
         normalized = normalized.permute(0, 3, 1, 2)
-        return pad_to_patch_multiple(normalized).contiguous()
+        return resample_to_patch_multiple(normalized, self.image_hw).contiguous()
 
     def _forward_features(self, flat: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+        """Run the backbone blocks, checkpointing them when asked to.
+
+        timm's own checkpointing lives in ``VisionTransformer.forward_features``,
+        and this RoPE-aware loop replaces that method wholesale -- so
+        ``set_grad_checkpointing`` on its own only sets a flag that nothing on this
+        path ever reads.  The blocks have to be wrapped here, which is also why the
+        wrap is unconditional on ``tokens.requires_grad``: ``queries`` comes from
+        the trainable ``scene_embeds``, so the checkpointed input always carries a
+        gradient path and ``use_reentrant=False`` engages rather than degrading to
+        a plain call.
+        """
+
         backbone = self.backbone
         tokens = backbone.patch_embed(flat)
         tokens, rope = backbone._pos_embed(tokens)
@@ -282,9 +338,22 @@ class DrivoRDinoV3Student(nn.Module):
                 f"RoPE prefix was widened for {self.num_scene_tokens} scene queries, got {token_count}"
             )
         tokens = torch.cat((queries, tokens), dim=1)
-        for block in backbone.blocks:
-            tokens = block(tokens, rope=rope)
-        return backbone.norm(tokens)[:, :token_count]
+        out_dtype = tokens.dtype
+        # use_reentrant=False replays this autocast state inside the checkpointed
+        # recompute, so bf16 stays consistent between forward and backward.  When
+        # vision_bf16 is off we enter NO context (not enabled=False) so an outer
+        # --precision bf16 autocast still propagates into the trunk instead of
+        # being disabled here.
+        amp_ctx = (torch.autocast(tokens.device.type, dtype=torch.bfloat16)
+                   if self.vision_bf16 else nullcontext())
+        with amp_ctx:
+            for block in backbone.blocks:
+                if self.grad_checkpointing:
+                    tokens = checkpoint(block, tokens, rope, use_reentrant=False)
+                else:
+                    tokens = block(tokens, rope=rope)
+            tokens = backbone.norm(tokens)[:, :token_count]
+        return tokens.to(out_dtype)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """``[B, N, 3, H, W]`` images in [0, 1] -> ``[B, N * T, output_dim]``."""

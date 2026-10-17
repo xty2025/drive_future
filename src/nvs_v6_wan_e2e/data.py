@@ -10,6 +10,43 @@ from typing import Any, Protocol
 
 import torch
 
+#: Future frames decoded per GT trajectory, at +0.5..+4.0s.  Nothing is pooled across
+#: time: an earlier revision folded each *pair* of frames into one target, which put
+#: +0.5s and +1.0s in the same linear subspace and left the token able to tell them
+#: apart only through the shape of the PCA basis.  This is also the trajectory's pose
+#: count, so the frame axis has a 1:1 correspondence with the eight waypoints.
+FUTURE_FRAMES = 8
+
+#: How many of DINOv3's own prefix queries read each future frame, and therefore how
+#: many register tokens one frame contributes.
+#:
+#: CLS alone is not enough, and the four registers read out verbatim are no better than
+#: it.  On 12 scenes (48 GTs, 384 frames), standardized, the within-scene/across-scene
+#: separation ratio is 0.211 for ``cls_only`` and 0.194 for ``dinov3_registers``, against
+#: 0.456 for the CLS used as a *query* in the cosine attention.  What works is using the
+#: four registers as queries in that same attention: 0.458 separation and, decisively,
+#: 0.771 correlation between target distance and trajectory distance against the CLS
+#: query's 0.684 -- because the four land on complementary regions (left road edge, right
+#: verge, intersection, traffic furniture) where one CLS dot lands on a handful of pixels.
+#: Four is DINOv3's own prefix count at this resolution, so "more tokens" means the
+#: Teacher's trained queries rather than an invented split of the grid.  Measured by
+#: ``scripts/probe_future_readout.py``; figures in ``artifacts/future_readout_probe/``.
+#:
+#: Defined here rather than next to the readout because it sets the *target axis* every
+#: consumer shares -- ``PairTargets``, the Stage-0 cache, the loader's placeholders and
+#: the DiT's ``future_tokens`` -- and ``data`` is the module none of those can import
+#: from in the other direction.
+REGISTER_QUERIES_PER_FRAME = 4
+
+#: Length of the register axis: ``[B, K, REGISTER_TOKENS, target_dim]``, frame-major so
+#: token ``q + REGISTER_QUERIES_PER_FRAME * f`` is query ``q`` of frame ``f``.  The
+#: per-frame multiplicity multiplies the token count and leaves the frame axis alone:
+#: the DiT's RoPE phase and the trajectory alignment stay per frame (see
+#: ``wan_dit.NvsActionDiT.register_rope``), and ``future_chunk_valid``/``future_quality``
+#: repeat each frame's value across its queries so the weighted L1 keeps reducing over
+#: tokens as an element-mean.
+REGISTER_TOKENS = FUTURE_FRAMES * REGISTER_QUERIES_PER_FRAME
+
 
 @dataclass
 class Observation:
@@ -67,7 +104,7 @@ class PairTargets:
     future_quality: torch.Tensor
     pair_ids: Any
 
-    def validate(self, max_gt: int = 4, registers: int = 4) -> None:
+    def validate(self, max_gt: int = 4, registers: int = REGISTER_TOKENS) -> None:
         if self.gt_trajectory.ndim != 4 or self.gt_trajectory.shape[-2:] != (8, 3):
             raise ValueError("gt_trajectory must be [B,K,8,3] metric x,y,heading")
         if self.gt_valid.shape != self.gt_trajectory.shape[:2]:
@@ -77,11 +114,11 @@ class PairTargets:
         if self.future_register.shape[:2] != self.gt_trajectory.shape[:2]:
             raise ValueError("future_register and trajectory must share B,K")
         if self.future_register.shape[2] != registers:
-            raise ValueError("future_register must contain four ordered chunks")
+            raise ValueError(f"future_register must contain {registers} ordered register targets")
         if self.future_chunk_valid.shape != self.future_register.shape[:3]:
-            raise ValueError("future_chunk_valid must be [B,K,4]")
+            raise ValueError(f"future_chunk_valid must be [B,K,{registers}]")
         if self.future_quality.shape != self.future_register.shape[:3]:
-            raise ValueError("future_quality must be [B,K,4]")
+            raise ValueError(f"future_quality must be [B,K,{registers}]")
 
 
 class FutureViewProvider(Protocol):
@@ -106,9 +143,9 @@ def load_multigt_npz(path: str | Path, target_dim: int = 256) -> PairTargets:
         raise ValueError(f"{path} is not a v6 8-step trajectory artifact")
     trajectories = _resample_or_pad_trajectory(trajectories, 8)
     k = trajectories.shape[0]
-    future = torch.zeros(k, 4, target_dim, dtype=torch.float32)
-    chunk_valid = torch.zeros(k, 4, dtype=torch.bool)
-    quality = torch.ones(k, 4, dtype=torch.float32)
+    future = torch.zeros(k, REGISTER_TOKENS, target_dim, dtype=torch.float32)
+    chunk_valid = torch.zeros(k, REGISTER_TOKENS, dtype=torch.bool)
+    quality = torch.ones(k, REGISTER_TOKENS, dtype=torch.float32)
     pair_ids = [{"gt_id": str(i), "original_gt_id": str(i), "source": str(path)} for i in range(k)]
     return PairTargets(
         gt_trajectory=trajectories.unsqueeze(0),

@@ -18,6 +18,7 @@ from PIL import Image
 from .data import (
     Observation,
     PairTargets,
+    REGISTER_TOKENS,
     drivor_observable_ego_feature,
     drivor_route_command,
 )
@@ -125,12 +126,12 @@ def load_real_navsim_sample(
     # This adapter has no Teacher target: the Future Register must be marked
     # INVALID rather than valid-with-zeros.  Zeros carrying chunk_valid=True
     # silently train the register toward the origin, which is why the joint
-    # trainer had to freeze phi and hardcode lambda_future=0.  Real targets come
-    # from scripts/build_future_target_cache.py and are read back by
+    # trainer had to hardcode lambda_future=0.  Real targets come from
+    # scripts/build_future_target_cache.py and are read back by
     # target_cache.Stage1SceneDataset / scene_target_path.
-    future_register = torch.zeros(gt_count, 4, target_dim, dtype=torch.float32)
-    future_chunk_valid = torch.zeros(gt_count, 4, dtype=torch.bool)
-    future_quality = torch.zeros(gt_count, 4, dtype=torch.float32)
+    future_register = torch.zeros(gt_count, REGISTER_TOKENS, target_dim, dtype=torch.float32)
+    future_chunk_valid = torch.zeros(gt_count, REGISTER_TOKENS, dtype=torch.bool)
+    future_quality = torch.zeros(gt_count, REGISTER_TOKENS, dtype=torch.float32)
     targets = PairTargets(
         gt_trajectory=trajectories.unsqueeze(0),
         gt_valid=valid.unsqueeze(0),

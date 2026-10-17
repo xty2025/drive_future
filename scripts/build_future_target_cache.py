@@ -2,21 +2,22 @@
 
 One frozen-Teacher pass per scene, ever.  The register target cannot change
 during training -- ``config_v6_wan_e2e.yaml`` puts ``teacher`` and
-``target_compressor`` in ``stage1.freeze`` and ``stage2.freeze`` -- so decoding
+``target_standardizer`` in ``stage1.freeze`` and ``stage2.freeze`` -- so decoding
 four ``future.mp4`` files and running DINOv3 over 32 frames on every epoch is
-pure repeated work.  This script does it once and writes ``[K,4,256]`` float32
-plus the metric trajectories, ~66 KB per scene, ~6.8 GB for the 103075-scene
-corpus.
+pure repeated work.  This script does it once and writes ``[K,32,D]`` float32 plus
+the metric trajectories -- four DINOv3 prefix-query-extracted, standardized tokens
+per future frame at +0.5..+4.0s, frame-major, 512 KB of register data at ``K=4``
+and DINOv3-Large's ``D=1024``.
 
 Two ordering constraints shape the run:
 
-* The compressor is fit **once, on rank 0, over training scenes only**, and every
-  rank then loads that same ``compressor.pt``.  An SVD basis is only defined up to
-  column order and sign, so 32 independently-fit compressors would emit 32
-  mutually incomparable target spaces and the all-reduced Stage-1 gradient would
-  average unrelated numbers.
+* The standardizer is fit **once, on rank 0, over training scenes only**, and every
+  rank then loads that same ``standardizer.pt``.  A diagonal mean/std has no basis
+  ambiguity, but two fits on different subsets still differ by a per-dimension
+  rescaling, and targets built under different rescalings are not comparable -- the
+  all-reduced Stage-1 gradient would average them anyway.
 * The train/eval split is decided **before** the fit and shared with the trainer
-  through ``split_scene_tokens``, so no eval scene can leak into the basis.
+  through ``split_scene_tokens``, so no eval scene can leak into it.
 
 Sharding is ``tokens[rank::world]``, which needs no coordination once the index
 sidecar exists.  Under torchrun the rank comes from the environment; a plain
@@ -57,23 +58,29 @@ from nvs_v6_wan_e2e.multiview_data import (
     load_multiview_sample,
 )
 from nvs_v6_wan_e2e.target_cache import (
+    PAYLOAD_FORMAT,
     atomic_json_write,
     atomic_torch_save,
     build_scene_payload,
-    compressor_path,
     list_cached_scenes,
+    load_standardizer,
     manifest_path,
     ready_scenes_path,
-    save_compressor,
+    save_standardizer,
     scene_target_path,
     split_scene_tokens,
-    load_compressor,
+    standardizer_path,
 )
 from nvs_v6_wan_e2e.teacher import (
+    MAX_QUERY_ATTENTION_ENTROPY,
     NATIVE_FUTURE_IMAGE_HW,
-    Ordered2x2Compressor,
+    QUERY_HEADS,
+    QUERY_TEMPERATURE,
+    FutureQueryExtractor,
+    TargetStandardizer,
     TimmDinoV3Teacher,
-    ordered_quadrant_vectors,
+    measure_target_quality,
+    query_future_register,
 )
 from nvs_v6_wan_e2e.vision import DRIVOR_OFFICIAL_IMAGE_HW
 
@@ -106,8 +113,9 @@ def setup_distributed(shard_index: int, shard_count: int) -> Dist:
     torch.cuda.set_device(device)
     enabled = False
     if has_env and world > 1:
-        # Rank 0 walks all 103075 scene directories and fits the SVD while every
-        # other rank waits; a short timeout would abort on that legitimate skew.
+        # Rank 0 walks all 103075 scene directories and fits the target mean/std
+        # while every other rank waits; a short timeout would abort on that
+        # legitimate skew.
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=6))
         enabled = True
         world = int(os.environ["WORLD_SIZE"])
@@ -198,22 +206,22 @@ def read_scene_index(dctx: Dist, args: argparse.Namespace) -> list[str]:
 
 
 
-def _ordered_block(sample: MultiViewSample, teacher: TimmDinoV3Teacher, device: torch.device) -> torch.Tensor:
-    """``[K,4,8192]`` quadrant-pooled Teacher features for one scene.
+def _query_block(
+    sample: MultiViewSample,
+    teacher: TimmDinoV3Teacher,
+    extractor: FutureQueryExtractor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``([K,32,D] query tokens, [K*32,heads] normalized entropies)`` for one scene.
 
-    Each GT's eight-frame grid is reduced as it is produced and never retained: a
-    grid is 50 MB float32 at the future videos' native 29x52 while its ordered
-    vectors are 131 KB, which is what lets the fit set stay in RAM.
+    Each GT's eight-frame patch grid is reduced as it is produced and never retained: a
+    grid is 49 MB float32 at the future videos' native 29x52 while its thirty-two query
+    tokens are 128 KB, which is what lets the fit set stay in RAM.
     """
 
     if sample.future_rgb is None:
         raise ValueError(f"{sample.scene_id} was loaded without future RGB")
-    blocks = []
-    for gt_index in range(sample.future_rgb.shape[1]):
-        grid = teacher(sample.future_rgb[:, gt_index].to(device)).float().cpu()
-        blocks.append(ordered_quadrant_vectors(grid))
-        del grid
-    return torch.cat(blocks, dim=0)
+    return query_future_register(teacher, extractor, sample.future_rgb, device)
 
 
 def _load_sample(args: argparse.Namespace, scene_id: str, log_cache: dict[str, list[dict]]) -> MultiViewSample:
@@ -238,59 +246,135 @@ def _load_sample(args: argparse.Namespace, scene_id: str, log_cache: dict[str, l
     )
 
 
-def fit_compressor(dctx: Dist, args: argparse.Namespace, train_tokens: list[str], teacher: TimmDinoV3Teacher) -> dict[str, Any]:
-    """Rank 0 only: SVD over the ordered vectors of ``--fit-scenes`` train scenes.
+def fit_standardizer(
+    dctx: Dist,
+    args: argparse.Namespace,
+    train_tokens: list[str],
+    teacher: TimmDinoV3Teacher,
+    extractor: FutureQueryExtractor,
+) -> dict[str, Any]:
+    """Rank 0 only: mean/std over the query tokens of ``--fit-scenes`` train scenes.
 
-    ``Ordered2x2Compressor.fit`` treats every ordered chunk as its own row, so the
-    rank is ``min(target_dim, 16 * scenes)``: 16 scenes already saturate a 256-d
-    target.  ``--fit-scenes`` defaults well past that because a basis estimated
-    from 256 rows is noisy even when it is full rank.
+    ``TargetStandardizer.fit`` treats every register token of every GT as its own row,
+    so at ``K = 4`` the fit sees ``128 * scenes`` rows -- 65536 rows for 1024 dimensions
+    at the default, which pins each per-dimension std to ~0.4% relative error.  Those
+    rows pool the four queries of a frame together, which is what the probe measured its
+    numbers under, so the standardization the target is audited in and the one it is
+    trained in are the same map.  Unlike the SVD basis this replaced, more scenes cannot
+    make the target *degenerate*; they can only estimate the scaling better.
+    ``--fit-scenes`` is therefore a precision knob, not a correctness gate, and nothing
+    here refuses a small fit.
+
+    What is refused is a flat readout, via
+    :data:`~nvs_v6_wan_e2e.teacher.MAX_QUERY_ATTENTION_ENTROPY`.  See
+    ``measure_target_quality`` for why the separation ratio and the trajectory
+    correlation are audited but not gated.
     """
 
     fit_count = min(int(args.fit_scenes), len(train_tokens))
     if fit_count < 1:
-        raise ValueError("the compressor fit needs at least one training scene")
+        raise ValueError("the standardizer fit needs at least one training scene")
     log_cache: dict[str, list[dict]] = {}
     blocks: list[torch.Tensor] = []
+    trajectories: list[torch.Tensor] = []
+    entropy_sum = 0.0
+    entropy_max = 0.0
+    entropy_rows = 0
     fitted: list[str] = []
+    degenerate = 0
     started = time.time()
+    last_progress = started
     for scene_id in train_tokens[:fit_count]:
         try:
             sample = _load_sample(args, scene_id, log_cache)
-            blocks.append(_ordered_block(sample, teacher, dctx.device))
+            block, entropies = _query_block(sample, teacher, extractor, dctx.device)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             log(dctx, {"event": "fit_scene_skipped", "scene": scene_id, "reason": str(error)})
             continue
+        blocks.append(block)
+        trajectories.append(sample.targets.gt_trajectory[0].float().cpu())
+        degenerate += int(bool(sample.metadata["degenerate_multi_gt"]))
+        entropy_sum += float(entropies.sum())
+        entropy_max = max(entropy_max, float(entropies.max()))
+        entropy_rows += int(entropies.shape[0] * entropies.shape[1])
         fitted.append(scene_id)
-        del sample
+        del sample, block, entropies
+        # Only rank 0 fits; the other ranks are already parked in ``barrier()``, so a
+        # quiet fit is indistinguishable from a NCCL hang from the outside -- the
+        # StateMonitor starts warning at 60 s of no collective progress.  At the
+        # default ``--fit-scenes 512`` this loop is 15-25 min of exactly that, so it
+        # emits a liveness line every 30 s instead.
+        if time.time() - last_progress >= 30.0:
+            elapsed = time.time() - started
+            last_progress = time.time()
+            log(
+                dctx,
+                {
+                    "event": "standardizer_fit_progress",
+                    "scenes": len(fitted),
+                    "of": fit_count,
+                    "elapsed_s": round(elapsed, 1),
+                    "eta_s": round(elapsed / len(fitted) * (fit_count - len(fitted)), 1),
+                },
+            )
     if not blocks:
-        raise RuntimeError("no training scene could be loaded for the compressor fit")
-    fit_vectors = torch.cat(blocks, dim=0)
-    compressor = Ordered2x2Compressor(output_dim=int(args.target_dim))
-    compressor.fit(
-        fit_vectors,
-        source_hash="+".join(fitted),
-        split="train",
+        raise RuntimeError("no training scene could be loaded for the standardizer fit")
+    fit_rows = torch.cat([block.reshape(-1, teacher.feature_dim) for block in blocks], dim=0)
+    standardizer = TargetStandardizer(
+        feature_dim=int(teacher.feature_dim),
+        temperature=float(args.query_temperature),
+        heads=int(args.query_heads),
     )
-    fit_rows = int(fit_vectors.shape[0] * fit_vectors.shape[1])
+    standardizer.fit(fit_rows, source_hash="+".join(fitted), split="train")
+    entropy_mean = entropy_sum / max(entropy_rows, 1)
     audit = {
         "teacher_checkpoint": str(args.dino_checkpoint),
         "teacher_image_hw": [int(args.teacher_image_hw[0]), int(args.teacher_image_hw[1])],
         "teacher_grid_hw": [int(value) for value in teacher.grid_hw],
-        "compressor_input_dim": int(compressor.state.input_dim),
-        "compressor_output_dim": int(compressor.state.output_dim),
-        "compressor_rank": int(min(args.target_dim, fit_rows)),
-        "compressor_fit_rows": fit_rows,
-        "compressor_fit_scenes": len(fitted),
-        "compressor_full_rank": bool(min(args.target_dim, fit_rows) >= args.target_dim),
-        "compressor_fingerprint": compressor.fingerprint(),
+        "register_target_dim": int(teacher.feature_dim),
+        "query_temperature": float(args.query_temperature),
+        "query_heads": int(args.query_heads),
+        # The extractor's one silent failure mode.  A uniform readout *is* the mean
+        # pool it replaced, keeps every downstream number finite, and discards the
+        # 81% of the GT-discriminating variance that lives in the spatial pattern.
+        "query_attention_entropy_mean": round(entropy_mean, 6),
+        "query_attention_entropy_max": round(entropy_max, 6),
+        "query_attention_entropy_rows": entropy_rows,
+        "standardizer_fit_rows": int(fit_rows.shape[0]),
+        "standardizer_fit_scenes": len(fitted),
+        # Degenerate scenes (duplicate Multi-GT labels) stay in the fit -- their rows
+        # are legitimate mean/std data -- but their two futures are identical, so they
+        # pull ``separation_ratio`` down.  Counted so a low ratio can be attributed
+        # rather than guessed at; pessimistic is the safe direction for an audit.
+        "standardizer_fit_degenerate_scenes": degenerate,
+        "standardizer_clamped_components": int(standardizer.state.clamped_components),
+        "standardizer_fingerprint": standardizer.fingerprint(),
         "fit_scene_ids": fitted,
         "fit_elapsed_s": round(time.time() - started, 1),
     }
-    save_compressor(args.target_cache_root, compressor, audit)
-    del blocks, fit_vectors
+    # Quality is measured on the standardized targets: standardization is a
+    # per-dimension affine map, so it moves both numbers, and the standardized space
+    # is the one the Stage-1 L1 lives in.
+    audit.update(
+        measure_target_quality(
+            [standardizer.transform(block) for block in blocks],
+            trajectories,
+        )
+    )
+    # Log before saving, so a rejected fit still leaves its numbers on the record.
+    log(dctx, {"event": "standardizer_fit", **{key: value for key, value in audit.items() if key != "fit_scene_ids"}})
+    if entropy_mean > MAX_QUERY_ATTENTION_ENTROPY and not args.allow_degenerate_query:
+        raise ValueError(
+            f"refusing to persist a target whose query attention is {entropy_mean:.4f} of uniform "
+            f"(max frame {float(entropy_max):.4f}, ceiling {MAX_QUERY_ATTENTION_ENTROPY}): the readout has "
+            f"degenerated into a mean pool over {teacher.grid_hw[0]}x{teacher.grid_hw[1]} patches, which keeps "
+            f"only the 19% of the GT-discriminating variance that is a per-frame average. Lower "
+            f"--query-temperature below {args.query_temperature}, or pass --allow-degenerate-query to "
+            f"persist it anyway."
+        )
+    save_standardizer(args.target_cache_root, standardizer, audit)
+    del blocks, trajectories, fit_rows
     gc.collect()
-    log(dctx, {"event": "compressor_fit", **{key: value for key, value in audit.items() if key != "fit_scene_ids"}})
     return audit
 
 
@@ -299,10 +383,11 @@ def build_shard(
     args: argparse.Namespace,
     tokens: list[str],
     teacher: TimmDinoV3Teacher,
-    compressor: Ordered2x2Compressor,
+    extractor: FutureQueryExtractor,
+    standardizer: TargetStandardizer,
 ) -> dict[str, Any]:
     shard = tokens[dctx.rank :: dctx.world]
-    fingerprint = compressor.fingerprint()
+    fingerprint = standardizer.fingerprint()
     log_cache: dict[str, list[dict]] = {}
     built = 0
     reused = 0
@@ -315,8 +400,8 @@ def build_shard(
             continue
         try:
             sample = _load_sample(args, scene_id, log_cache)
-            block = _ordered_block(sample, teacher, dctx.device)
-            register = compressor.transform_ordered(block)
+            block, _ = _query_block(sample, teacher, extractor, dctx.device)
+            register = standardizer.transform(block)
             payload = build_scene_payload(
                 future_register=register,
                 future_chunk_valid=sample.targets.future_chunk_valid[0],
@@ -326,7 +411,7 @@ def build_shard(
                 observation=sample.observation,
                 pair_ids=list(sample.targets.pair_ids[0]),
                 metadata=sample.metadata,
-                compressor_fingerprint=fingerprint,
+                target_fingerprint=fingerprint,
             )
             atomic_torch_save(payload, target)
             built += 1
@@ -360,9 +445,32 @@ def build_shard(
     }
 
 
+def shard_produced_nothing(result: dict[str, Any], cached_scene_count: int | None = None) -> bool:
+    """Whether this build wrote no usable target at all, and must not report success.
+
+    A per-scene ``except`` is required -- one unreadable scene out of 103075 must not
+    condemn the whole build, and a resumed run legitimately produces zero *new*
+    payloads while reusing thousands.  But the same tolerance hid a systematic fault:
+    ``build_scene_payload`` read ``history_paths`` from ``metadata``, where the loader
+    never puts it, so every scene raised ``KeyError``, and the run still printed
+    ``done``, wrote a manifest beside a ``targets/`` that did not exist, and exited 0.
+
+    The distinction is between a few bad scenes and *no cache at all*.  A systematic
+    fault is total, so "this shard has scenes and produced neither a new nor a reused
+    payload" and "the destination holds no target" are each sufficient.  Only rank 0
+    scans the destination, so the second clause is applied there alone; a shard whose
+    slice is empty because ``world`` exceeds the scene count is not a failure either.
+    """
+
+    produced = int(result["built"]) + int(result["reused"])
+    if bool(int(result["shard_scenes"])) and produced == 0:
+        return True
+    return cached_scene_count is not None and int(cached_scene_count) == 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--target-cache-root", required=True, help="destination for compressor.pt, targets/ and _manifest.json")
+    parser.add_argument("--target-cache-root", required=True, help="destination for standardizer.pt, targets/ and _manifest.json")
     parser.add_argument("--multiview-root", default=DEFAULT_MULTIVIEW_ROOT)
     parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT)
     parser.add_argument("--sensor-root", default=DEFAULT_SENSOR_ROOT)
@@ -370,12 +478,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dino-checkpoint", default=DEFAULT_DINO_CHECKPOINT)
     parser.add_argument("--image-hw", type=int, nargs=2, default=list(DRIVOR_OFFICIAL_IMAGE_HW), help="history size recorded in each payload; the trainer must ask for the same one")
     parser.add_argument("--teacher-image-hw", type=int, nargs=2, default=list(NATIVE_FUTURE_IMAGE_HW), help="must equal the future videos' native size; the Teacher refuses to interpolate")
-    parser.add_argument("--target-dim", type=int, default=256)
-    parser.add_argument("--fit-scenes", type=int, default=512, help="train scenes the SVD basis is estimated from; rank saturates at 16")
-    parser.add_argument("--eval-scenes", type=int, default=256, help="held out of training and of the compressor fit")
+    parser.add_argument(
+        "--query-temperature",
+        type=float,
+        default=QUERY_TEMPERATURE,
+        help="cosine-attention temperature of the prefix-query readout; part of the target fingerprint",
+    )
+    parser.add_argument(
+        "--query-heads",
+        type=int,
+        default=QUERY_HEADS,
+        help="query heads the patch grid is split over; part of the target fingerprint",
+    )
+    parser.add_argument(
+        "--fit-scenes",
+        type=int,
+        default=512,
+        help="train scenes the target mean/std are estimated from; a precision knob, not a rank gate",
+    )
+    parser.add_argument(
+        "--allow-degenerate-query",
+        action="store_true",
+        help="persist the target even when the query attention is close to uniform, i.e. the readout has become a mean pool",
+    )
+    parser.add_argument("--eval-scenes", type=int, default=256, help="held out of training and of the standardizer fit")
     parser.add_argument("--limit", type=int, default=None, help="cap the scene index; useful for a first subset build")
     parser.add_argument("--skip-degenerate", action="store_true", help="drop scenes whose Multi-GT trajectory labels collapse")
-    parser.add_argument("--overwrite", action="store_true", help="rebuild scenes that already have a cached target")
+    parser.add_argument("--overwrite", action="store_true", help="rebuild scenes that already have a cached target, and refit the standardizer")
     parser.add_argument("--rebuild-index", action="store_true", help="ignore any _ready_scenes.json sidecar and rescan the corpus")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=17)
@@ -405,30 +534,69 @@ def main() -> int:
     log(dctx, {"event": "split", "scenes": len(tokens), "train": len(train_tokens), "eval": len(eval_tokens)})
 
     teacher = TimmDinoV3Teacher(checkpoint=args.dino_checkpoint, image_hw=tuple(args.teacher_image_hw)).to(dctx.device)
-    if not compressor_path(args.target_cache_root).exists() or args.overwrite:
-        # Only rank 0 fits, and only it may: the basis has to be one basis.
+    if not standardizer_path(args.target_cache_root).exists() or args.overwrite:
+        # Only rank 0 fits, and only it may: the scaling has to be one scaling.
         if dctx.main:
-            fit_compressor(dctx, args, train_tokens, teacher)
+            fit_standardizer(
+                dctx,
+                args,
+                train_tokens,
+                teacher,
+                FutureQueryExtractor(teacher.feature_dim, args.query_temperature, args.query_heads),
+            )
         barrier(dctx)
-    compressor, fit_audit = load_compressor(args.target_cache_root)
+    standardizer, fit_audit = load_standardizer(args.target_cache_root)
+    # The readout's temperature and heads are not recoverable from ``mean``/``scale``,
+    # so a resumed run that changed either would silently build the second half of the
+    # cache in a different target space than the first half -- same width, same shapes,
+    # different tensors.  Refuse instead; ``--overwrite`` refits and so is exempt.
+    if standardizer.temperature != float(args.query_temperature) or standardizer.heads != int(args.query_heads):
+        raise ValueError(
+            f"{standardizer_path(args.target_cache_root)} was fit at temperature "
+            f"{standardizer.temperature} with {standardizer.heads} heads, but this run asks for "
+            f"{args.query_temperature} with {args.query_heads}. Pass --overwrite to refit and rebuild "
+            f"every scene, or drop the flags to extend the existing cache."
+        )
+    # Built from the *loaded* state, never from args, so the shard and the fit cannot
+    # disagree about which readout produced the cache.
+    extractor = FutureQueryExtractor(
+        int(standardizer.state.feature_dim),
+        float(standardizer.temperature),
+        int(standardizer.heads),
+    )
     log(
         dctx,
         {
-            "event": "compressor_loaded",
-            "fingerprint": compressor.fingerprint(),
-            "rank": fit_audit.get("compressor_rank"),
-            "fit_rows": fit_audit.get("compressor_fit_rows"),
-            "full_rank": fit_audit.get("compressor_full_rank"),
+            "event": "standardizer_loaded",
+            "fingerprint": standardizer.fingerprint(),
+            "register_target_dim": int(standardizer.state.feature_dim),
+            "query_temperature": standardizer.temperature,
+            "query_heads": standardizer.heads,
+            "fit_rows": fit_audit.get("standardizer_fit_rows"),
+            "fit_scenes": fit_audit.get("standardizer_fit_scenes"),
+            "attention_entropy_mean": fit_audit.get("query_attention_entropy_mean"),
+            "attention_entropy_max": fit_audit.get("query_attention_entropy_max"),
+            "clamped_components": fit_audit.get("standardizer_clamped_components"),
+            "separation_ratio": fit_audit.get("separation_ratio"),
+            "trajectory_distance_pearson": fit_audit.get("trajectory_distance_pearson"),
+            "trajectory_distance_spearman": fit_audit.get("trajectory_distance_spearman"),
         },
     )
 
-    result = build_shard(dctx, args, tokens, teacher, compressor)
+    result = build_shard(dctx, args, tokens, teacher, extractor, standardizer)
     barrier(dctx)
+    # Decided per rank, and only after the barrier: raising inside ``build_shard``
+    # would leave the other ranks blocked in the collective and turn a legible
+    # failure into a hang.  ``torchrun`` fails the job if any rank returns non-zero.
+    cached = list_cached_scenes(args.target_cache_root) if dctx.main else None
+    total_failure = shard_produced_nothing(result, None if cached is None else len(cached))
     if dctx.main:
-        cached = list_cached_scenes(args.target_cache_root)
+        # Written even on failure, with ``cached_scene_count`` 0 and the reason count:
+        # the manifest is the durable record of what the run did, and a partial
+        # failure that a per-scene ``except`` tolerated must outlive its log line.
         atomic_json_write(
             {
-                "format": 1,
+                "format": PAYLOAD_FORMAT,
                 "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "world_size": dctx.world,
                 "multiview_root": str(Path(args.multiview_root)),
@@ -437,7 +605,7 @@ def main() -> int:
                 "cache_root": str(Path(args.cache_root)),
                 "image_hw": [int(args.image_hw[0]), int(args.image_hw[1])],
                 "teacher_image_hw": [int(args.teacher_image_hw[0]), int(args.teacher_image_hw[1])],
-                "target_dim": int(args.target_dim),
+                "register_target_dim": int(standardizer.state.feature_dim),
                 "seed": int(args.seed),
                 "eval_scenes": int(args.eval_scenes),
                 "skip_degenerate": bool(args.skip_degenerate),
@@ -445,15 +613,31 @@ def main() -> int:
                 "train_scene_count": len(train_tokens),
                 "eval_scene_count": len(eval_tokens),
                 "cached_scene_count": len(cached),
-                "compressor": fit_audit,
-                "compressor_fingerprint": compressor.fingerprint(),
+                "failed_scene_count": int(result["failed_count"]),
+                "standardizer": fit_audit,
+                "target_fingerprint": standardizer.fingerprint(),
             },
             manifest_path(args.target_cache_root),
         )
-        log(dctx, {"event": "done", "cached_scenes": len(cached), "scene_index": len(tokens), "manifest": str(manifest_path(args.target_cache_root))})
     log(dctx, {"event": "shard_done", **result}, all_ranks=True)
     if dctx.enabled:
         dist.destroy_process_group()
+    if total_failure:
+        log(
+            dctx,
+            {
+                "event": "no_cached_target",
+                "shard_scenes": result["shard_scenes"],
+                "built": result["built"],
+                "reused": result["reused"],
+                "failed_count": result["failed_count"],
+                "first_reasons": result["failed"][:5],
+            },
+            all_ranks=True,
+        )
+        return 1
+    if dctx.main:
+        log(dctx, {"event": "done", "cached_scenes": len(cached), "scene_index": len(tokens), "manifest": str(manifest_path(args.target_cache_root))})
     return 0
 
 

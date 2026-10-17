@@ -219,25 +219,29 @@ def gather_flow_data(anchor: torch.Tensor, ground_truth: torch.Tensor, gt_valid:
 def dense_future_l1(predicted_register: torch.Tensor, targets: PairTargets, proposals: torch.Tensor) -> torch.Tensor:
     """Stage-2 future loss: every candidate is supervised by its nearest GT's future.
 
-    ``paired_future_l1`` could only reach the K candidates a Hungarian match
-    happened to pick, so 60+ of the 64 register rows got zero future gradient even
-    though Stage 1 had trained them -- the register the Action stream reads in
-    cross-attention was therefore mostly untrained at Stage 2.  Pairing each
+    A Hungarian-only pairing could reach just the K candidates the match happened to
+    pick, so 60+ of the 64 register rows would get zero future gradient even though
+    Stage 1 had trained them -- and the future queries share the DiT trunk with the
+    action tokens, so an untrained row is an untrained trajectory too.  Pairing each
     candidate with the GT it is closest to makes the future branch dense and
     consistent with :func:`drivor_dense_loss`.
     """
     index, supervised = nearest_gt_index(proposals, targets.gt_trajectory, targets.gt_valid)
     b, m = index.shape
-    chunks, width = targets.future_register.shape[2], targets.future_register.shape[3]
-    future = torch.gather(targets.future_register, 1, index.view(b, m, 1, 1).expand(b, m, chunks, width))
-    per_chunk = index.view(b, m, 1).expand(b, m, chunks)
-    # The chunk mask and quality live on the GT axis, so they must be gathered with
-    # the same index -- otherwise a candidate inherits another GT's validity.
-    weight = torch.gather(targets.future_quality, 1, per_chunk) * torch.gather(targets.future_chunk_valid, 1, per_chunk)
+    tokens, width = targets.future_register.shape[2], targets.future_register.shape[3]
+    future = torch.gather(targets.future_register, 1, index.view(b, m, 1, 1).expand(b, m, tokens, width))
+    per_token = index.view(b, m, 1).expand(b, m, tokens)
+    # The validity mask and quality live on the GT axis, so they must be gathered
+    # with the same index -- otherwise a candidate inherits another GT's validity.
+    weight = torch.gather(targets.future_quality, 1, per_token) * torch.gather(targets.future_chunk_valid, 1, per_token)
     weight = weight * supervised.view(b, m, 1).to(weight.dtype)
     denominator = weight.sum()
     if float(denominator) <= 0:
         return predicted_register.sum() * 0.0
+    # ``mean(dim=-1)`` reduces the 1024 feature width to one number per register token
+    # and the weighted mean then reduces the token axis, so widening the target from one
+    # token per frame to four leaves the loss's scale untouched -- it stays an
+    # element-mean over the target, not a sum over it.
     error = (predicted_register - future.detach()).abs().mean(dim=-1)
     return (error * weight).sum() / denominator
 
@@ -248,10 +252,12 @@ def _quality_weighted_chunk_l1(
     chunk_valid: torch.Tensor,
     quality: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Quality- and validity-weighted L1 over the four future chunks of one row.
+    """Quality- and validity-weighted L1 over the register targets of one row.
 
-    Returns ``None`` when the row carries no usable chunk, so callers can skip it
-    instead of dividing by a zero weight sum.
+    Returns ``None`` when the row carries no usable token, so callers can skip it
+    instead of dividing by a zero weight sum.  The reduction is an element-mean: the
+    feature width first, then a weighted mean over the token axis, so the value does not
+    scale with how many tokens a frame contributes.
     """
 
     weights = quality.to(prediction.device) * chunk_valid.to(prediction.device)
@@ -261,36 +267,28 @@ def _quality_weighted_chunk_l1(
     return (error * weights).sum() / weights.sum()
 
 
-def paired_future_l1(predicted_register: torch.Tensor, targets: PairTargets, assignment: list[Assignment]) -> torch.Tensor:
-    losses: list[torch.Tensor] = []
-    for batch, match in enumerate(assignment):
-        for gt_index, candidate_index in match.as_pairs():
-            loss = _quality_weighted_chunk_l1(
-                predicted_register[batch, candidate_index],
-                targets.future_register[batch, gt_index],
-                targets.future_chunk_valid[batch, gt_index],
-                targets.future_quality[batch, gt_index],
-            )
-            if loss is not None:
-                losses.append(loss)
-    if not losses:
-        return predicted_register.sum() * 0.0
-    return torch.stack(losses).mean()
-
-
 def identity_future_l1(predicted_register: torch.Tensor, targets: PairTargets) -> torch.Tensor:
     """Stage-1 future loss over the pairing the dataset already provides.
 
-    Each register row is conditioned on ``targets.gt_trajectory`` of the same row,
-    so row ``k`` is supervised by GT ``k``'s compressed future: no Hungarian
-    assignment, and every valid GT row receives gradient rather than only the few
-    candidates an anchor codebook happened to match.
+    Stage 1 feeds ``targets.gt_trajectory`` in as the clean action, so register row
+    ``k`` is the DiT's read-out for GT ``k`` and is supervised by GT ``k``'s
+    per-frame future: no Hungarian assignment, and every valid GT row receives
+    gradient rather than only the few candidates an anchor codebook happened to
+    match.
+
+    All four axes are checked, not just ``(B, K)``.  A row-count mismatch is the
+    one that breaks the pairing, but a width mismatch -- ``future_head`` built at
+    ``d_model`` while the cache's standardizer says the Teacher's own feature width
+    -- is the likelier one, and unchecked it surfaces as a broadcast ``RuntimeError``
+    from inside ``_quality_weighted_chunk_l1`` that names neither tensor nor axis.
     """
 
-    if predicted_register.shape[:2] != targets.future_register.shape[:2]:
+    if predicted_register.shape != targets.future_register.shape:
         raise ValueError(
-            "identity pairing needs one register row per GT row, got "
-            f"{tuple(predicted_register.shape[:2])} against {tuple(targets.future_register.shape[:2])}"
+            "identity pairing needs one register row per GT row, shaped exactly like the "
+            "cached target, got "
+            f"{tuple(predicted_register.shape)} against {tuple(targets.future_register.shape)} "
+            "as [B, K, register_tokens, register_target_dim]"
         )
     losses: list[torch.Tensor] = []
     for batch in range(predicted_register.shape[0]):
