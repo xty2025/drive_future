@@ -1,0 +1,9 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_pseudo_expert
+  - _self_
+
+# Same GT package, 64 predictions and coefficient as the L1 experiment.
+# Pseudo-experts now use exactly the original multi-GT X->v MSE machinery.
+config:
+  pseudo_expert:
+    loss_type: velocity

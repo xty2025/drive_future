@@ -1,0 +1,10 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_pseudo_expert_vmse
+  - drivoR_action_dit_dinov3_vitl_register
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit_register.agent.DrivoRActionRegisterAgent
+
+# Original multi-GT v MSE + 0.5 * CLOVER expert v MSE, with joint future
+# register denoising. Only the original multi-GT has paired future video.
+# Keep the original DrivoR scorer; it sees detached trajectories only.

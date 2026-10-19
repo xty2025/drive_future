@@ -1,0 +1,7 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_single_gt
+  - _self_
+
+config:
+  # Original 4-second human trajectory + DrivoR's resampled 5-second long GT.
+  long_trajectory_additional_poses: 2

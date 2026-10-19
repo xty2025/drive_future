@@ -1,0 +1,3 @@
+# Tested runtime for online NAVSIM scoring workers.
+ray[default]==2.47.1
+opencensus==0.11.4

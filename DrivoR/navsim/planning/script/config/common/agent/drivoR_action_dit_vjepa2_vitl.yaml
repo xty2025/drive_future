@@ -1,0 +1,16 @@
+defaults:
+  - drivoR_action_dit_multigt
+  - _self_
+
+config:
+  image_size: [1152, 672]
+  multi_gt:
+    matching: nearest
+    weighting: equal
+  image_backbone:
+    family: vjepa2
+    model_name: vjepa2_vit_large
+    model_weights: ${oc.env:DRIVOR_VJEPA2_VITL_WEIGHTS,weights/vjepa2/vitl/target_encoder.safetensors}
+    use_lora: true
+    lora_rank: 32
+    finetune: false

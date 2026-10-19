@@ -1,0 +1,10 @@
+World4Scorer
+Copyright 2026 The World4Scorer Authors
+
+The candidate-bank sampling and bank outcome loss in model.py are adapted from
+World4Scorer, released under Apache License 2.0.
+Project: https://world4scorer.github.io/
+The reference source, LICENSE and NOTICE are retained under World4Scorer/ in
+this workspace. This adaptation adds configurable visual backbones, an independent
+eight-token future predictor, V-JEPA 2.1 targets, nearest-proposal multi-GT pairing
+and isolated training variants.

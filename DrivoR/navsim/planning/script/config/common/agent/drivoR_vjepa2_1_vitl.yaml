@@ -1,0 +1,9 @@
+defaults:
+  - drivoR_vjepa2_vitl
+  - _self_
+
+config:
+  image_backbone:
+    family: vjepa2_1
+    model_name: vjepa2_1_vit_large_384
+    model_weights: ${oc.env:DRIVOR_VJEPA2_1_VITL_WEIGHTS,weights/vjepa2_1/vitl/ema_encoder.safetensors}

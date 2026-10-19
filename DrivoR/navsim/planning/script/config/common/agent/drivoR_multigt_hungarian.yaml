@@ -1,0 +1,16 @@
+defaults:
+  - drivoR
+  - _self_
+
+config:
+  long_trajectory_additional_poses: 0
+  multi_gt:
+    enabled: true
+    root: ${oc.env:DRIVOR_MULTI_GT_ROOT,/cpfs29jb/data/zhaozc/project/drive_future/multi_traj_gt_data/navtrain_multigt_top4_dense_0p1s_f64_8gpu}
+    max_gt: 4
+    missing_policy: original
+    matching: hungarian
+    weighting: equal
+
+loss:
+  inter_weight: 0.0

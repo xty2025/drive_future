@@ -1,0 +1,2 @@
+# Optional dependency for camera images stored in Alibaba Cloud OSS.
+oss2==2.19.1

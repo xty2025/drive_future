@@ -1,0 +1,20 @@
+defaults:
+  - drivoR
+  - _self_
+
+config:
+  # Human best-of-64 + 0.5 * mean(other valid GTs' best-of-64), without long GT.
+  long_trajectory_additional_poses: 0
+  multi_gt:
+    enabled: true
+    root: ${oc.env:DRIVOR_MULTI_GT_ROOT,/cpfs29jb/data/zhaozc/project/drive_future/multi_traj_gt_data/navtrain_multigt_top4_dense_0p1s_f64_8gpu}
+    max_gt: 4
+    weighting: drive_jepa
+    human_weight: 1.0
+    other_weight: 0.5
+    # Keep uncovered scenes trainable using one original human GT, never padding copies.
+    # Fallback frequency is logged. Set error for strict dataset-only coverage.
+    missing_policy: original
+
+loss:
+  inter_weight: 0.0

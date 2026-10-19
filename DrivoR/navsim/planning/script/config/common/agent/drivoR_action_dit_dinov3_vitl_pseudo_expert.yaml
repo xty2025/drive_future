@@ -1,0 +1,15 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit.auxiliary.DrivoRActionDiTAuxiliaryAgent
+
+# Add physical-coordinate CLOVER L1 coverage; keep the original multi-GT v loss.
+# Pseudo-experts do not change the human-GT anchors, noise or timestep sampling.
+config:
+  pseudo_expert:
+    enabled: true
+    path: ${oc.env:DRIVOR_PSEUDO_EXPERT_PACK,${oc.env:NAVSIM_EXP_ROOT}/clover_data/pseudo_experts_k8_thr0p8}
+    top_k: 8
+    score_thr: 0.8
+    weight: 0.5
