@@ -2285,6 +2285,7 @@ def test_wan_backbone_skip_prefixes_keep_nvs_only_projections_random():
         "time_queries",
         "future_queries",
         "future_head.",
+        "trajectory_gates.",
         "scene_type_embedding",
         "action_type_embedding",
         "register_type_embedding",
@@ -2296,11 +2297,87 @@ def test_wan_backbone_skip_prefixes_keep_nvs_only_projections_random():
         "time_queries",
         "future_queries",
         "future_head.1.weight",
+        "trajectory_gates.0.q.weight",
         "scene_type_embedding",
         "action_type_embedding",
         "register_type_embedding",
     }
     assert NvsActionDiT.backbone_key_set(keys) == {"blocks.0.self_attn.q.weight"}
+
+
+def test_trajectory_gate_is_zero_at_init_one_way_and_reaches_the_register():
+    """The gate must add trajectory signal without ever adding a leak.
+
+    Measured on the production geometry, register rows give the eight action keys only
+    8-10% of their self-attention mass while the register's own input is
+    trajectory-independent, so the trajectory reaches the future readout through a
+    ~9%-per-hop channel -- and a contrast loss that supervises the across-GT difference
+    exactly still could not move ``residual_relative_l1`` off 1.0.  The gate is the
+    structural fix, and it has three properties that must hold simultaneously: it
+    contributes exactly zero at step 0 (so nothing pretrained is displaced), it writes
+    only the register slice (so ``Action never reads Register`` survives), and once
+    trained it is a real route from the action tokens into the register.
+    """
+    torch.manual_seed(4)
+    dit = NvsActionDiT(hidden_dim=256, action_tokens=8, future_tokens=32, target_dim=1024,
+                       num_heads=4, attn_head_dim=64, num_layers=8,
+                       text_dim=256, freq_dim=256, ego_dim=256).eval()
+
+    # (a) live at init: ``o`` keeps nn.Linear's default strength (a zero or 1e-2 gate
+    #     measurably wasted the whole warmup on the overfit probe) and the bias is zero.
+    for gate in dit.trajectory_gates:
+        assert float(gate.o.weight.std()) > 1e-3
+        assert bool((gate.o.bias == 0).all())
+    register = torch.randn(2, 32, 256)
+    action = torch.randn(2, 8, 256)
+    with torch.no_grad():
+        gate_out = dit.trajectory_gates[0](register, action)
+    assert gate_out.abs().max() > 0
+    # ...and same order as the register's own scale: a route, not a replacement.
+    assert float(gate_out.abs().mean()) < 3.0 * float(register.abs().mean())
+
+    # (b) one-way: perturbing the register input leaves the velocity bitwise identical
+    #     even with the gates in the graph.
+    ctx = torch.randn(8, 81, 256)
+    cond = torch.randn(8, 256)
+    act = torch.randn(8, 8, 256)
+    fut = torch.randn(8, 32, 256)
+    with torch.no_grad():
+        v0, r0 = dit(act, fut, cond, ctx)
+        v1, r1 = dit(act, fut + 50.0 * torch.randn_like(fut), cond, ctx)
+    assert torch.equal(v0, v1)
+    assert not torch.equal(r0, r1)
+
+    # (c) a real route: with the output projection live, the register moves when the
+    #     action changes, and the movement is exactly the gate's contribution on top of
+    #     the (already trajectory-reading) self-attention path.
+    for gate in dit.trajectory_gates:
+        nn.init.normal_(gate.o.weight, std=1e-2)
+    with torch.no_grad():
+        r_gate_on = dit(act, fut, cond, ctx)[1]
+        r_action_perturbed = dit(act + torch.randn_like(act), fut, cond, ctx)[1]
+    assert (r_action_perturbed - r_gate_on).abs().max() > 0
+
+    # (d) frame-aligned read: each register row has exactly one allowed action key, so the
+    #     softmax weight is 1 by construction and the read is independent of the query --
+    #     that is the alignment doing its job, not a bug.  What must change the output is
+    #     the aligned action row, and it must change ONLY that frame's register rows.
+    gate = dit.trajectory_gates[0]
+    assert bool((gate.frame_mask.sum(dim=-1) == 1).all())
+    with torch.no_grad():
+        out_a = gate(register, action)
+        out_query_shifted = gate(register + 7.0, action)
+    assert torch.equal(out_a, out_query_shifted)
+    with torch.no_grad():
+        out_value_shifted = gate(register, action + 1.0)
+    assert not torch.equal(out_a, out_value_shifted)
+    action_moved = action.clone()
+    action_moved[:, 3] += 5.0
+    with torch.no_grad():
+        out_frame_moved = gate(register, action_moved)
+    delta = (out_frame_moved - out_a).abs().mean(dim=-1)[0]
+    assert float(delta[12:16].max()) > 1e-4
+    assert float(torch.cat([delta[:12], delta[16:]]).max()) < 1e-6
 
 
 def test_future_queries_and_head_survive_the_wan_load_at_their_own_init():
@@ -2872,6 +2949,35 @@ def test_both_stage1_trainers_share_one_copy_of_the_verdict_maths():
     assert ddp.streaming_future_alignment is stage1_eval.streaming_future_alignment
 
 
+def test_subset_index_below_default_eval_count_is_clamped_not_fatal():
+    """``--limit`` subset builds must split, not die on the eval count.
+
+    The builder advertises ``--limit`` as "useful for a first subset build", but the split
+    refuses an eval count that leaves no training scene, so with the default
+    ``--eval-scenes 256`` any limit at or below 256 raised ``ValueError`` before a single
+    payload was written -- caught by the single-GPU pipeline verify at ``--limit 20``.
+    The builder now clamps to ``len(tokens) - 1`` (a no-op on the full corpus, so the
+    production split is untouched) and records the clamped value in the manifest, which is
+    what the trainer re-derives its split from.  This pins both halves: the unclamped call
+    is fatal, the clamped one splits cleanly.
+    """
+    from nvs_v6_wan_e2e.target_cache import split_scene_tokens
+
+    tokens = [f"{index:016x}" for index in range(20)]
+    with pytest.raises(ValueError, match="leaves no training scene"):
+        split_scene_tokens(tokens, 256, 17)
+    clamped = min(256, max(1, len(tokens) // 8))
+    train, evaluation = split_scene_tokens(tokens, clamped, 17)
+    # The cap must leave a train split large enough for a batched loader: clamping to
+    # len-1 instead would give 19 eval / 1 train, and Stage 1's drop_last DataLoader
+    # then dies with "rank 0 got no batch" -- the exact regression this pins.
+    assert len(train) >= 8 and evaluation
+    assert set(train).isdisjoint(evaluation)
+    assert len(train) + len(evaluation) == len(tokens)
+    # The clamp must be inert on a full-size index, or the production split would move.
+    assert min(256, max(1, 103075 // 8)) == 256
+
+
 def test_the_ddp_trainer_reproduces_the_builders_train_eval_split(tmp_path):
     """The trainer must inherit the split the standardizer was fit under.
 
@@ -3169,6 +3275,8 @@ def test_register_verdict_claims_skill_only_when_the_trajectory_earned_it():
             "mean_trajectory_response_alignment": 0.70,
             "mean_future_cosine_similarity": 0.42,
             "mean_future_relative_l1": 0.85,
+            "mean_residual_relative_l1": 0.70,
+            "mean_residual_cos_future": 0.35,
         }
         values.update(overrides)
         return values
@@ -3183,6 +3291,11 @@ def test_register_verdict_claims_skill_only_when_the_trajectory_earned_it():
     # all-zero predictor); "good enough" is anchored by scene_mean_target_l1 instead.
     assert learned["train_future_cosine_similarity"] == pytest.approx(0.42)
     assert learned["train_future_relative_l1"] == pytest.approx(0.85)
+    # The background-removed pair is passed through verbatim too, and gates nothing:
+    # it is the reading that stays honest when the raw cosine is flattered by the scene
+    # mean, so it must survive into the verdict JSON rather than live only in the step log.
+    assert learned["train_residual_relative_l1"] == pytest.approx(0.70)
+    assert learned["train_residual_cos_future"] == pytest.approx(0.35)
     # Every key the before/after summary prints must be one future_fit_metrics emits,
     # or the report silently drops a metric.
     assert set(CONDITIONING_SUMMARY_KEYS) <= set(metrics(0.40))
@@ -3295,11 +3408,15 @@ def test_streaming_alignment_prints_the_verdict_own_two_readings():
         summary["mean_future_cosine_similarity"], abs=1e-6
     )
     assert streamed["future_relative_l1"] == pytest.approx(summary["mean_future_relative_l1"], abs=1e-6)
+    assert streamed["residual_relative_l1"] == pytest.approx(summary["mean_residual_relative_l1"], abs=1e-6)
+    assert streamed["residual_cos_future"] == pytest.approx(summary["mean_residual_cos_future"], abs=1e-6)
 
     # A perfect register scores 1.0 / 0.0 on both readings.
     exact = streaming_future_alignment(future_register.clone(), targets)
     assert exact["future_cosine_similarity"] == pytest.approx(1.0, abs=1e-5)
     assert exact["future_relative_l1"] == pytest.approx(0.0, abs=1e-6)
+    assert exact["residual_relative_l1"] == pytest.approx(0.0, abs=1e-6)
+    assert exact["residual_cos_future"] == pytest.approx(1.0, abs=1e-5)
 
     # A batch with nothing valid returns zeros, never NaN: the trainer all-reduces
     # these across 16 ranks, where one NaN would erase every rank's reading.
@@ -3312,10 +3429,193 @@ def test_streaming_alignment_prints_the_verdict_own_two_readings():
         pair_ids=[[]],
     )
     empty = streaming_future_alignment(torch.zeros(1, 1, REGISTER_TOKENS, REGISTER_TARGET_DIM), blank)
-    assert empty == {"future_cosine_similarity": 0.0, "future_relative_l1": 0.0, "valid_scenes": 0}
+    assert empty == {
+        "future_cosine_similarity": 0.0,
+        "future_relative_l1": 0.0,
+        "residual_relative_l1": 0.0,
+        "residual_cos_future": 0.0,
+        "valid_scenes": 0,
+    }
 
     with pytest.raises(ValueError, match="does not match target"):
         streaming_future_alignment(predicted[:, :, : REGISTER_TOKENS - 1], targets)
+
+
+def test_residual_readings_exclude_the_scene_background():
+    """The residual readings are blind to anything a per-scene constant can explain.
+
+    Measured on 400 cached scenes the per-scene mean of the register target carries
+    **59.8%** of the L1 objective (0.792 predicting zero -> 0.318 predicting the scene
+    mean) and **79.3%** of its raw L2 energy (11.8% per-token global DC + 67.5%
+    scene-specific), leaving 40.2% that only reading the trajectory can win.  So a
+    register that reads the scene perfectly and the trajectory not at all still looks
+    *good* on the raw cosine -- the retired 8-token run read cos 0.6555 while both
+    gains were negative -- and the raw reading cannot carry the verdict on its own.
+    ``residual_relative_l1`` subtracts each side's own scene mean, which pins that
+    exact failure mode at 1.0 and makes anything below it real evidence.
+    """
+    from nvs_v6_wan_e2e.stage1_eval import streaming_future_alignment
+
+    torch.manual_seed(11)
+    scenes, rows = 6, 4
+    background = torch.randn(scenes, 1, REGISTER_TOKENS, REGISTER_TARGET_DIM) * 3.0
+    signal = torch.randn(scenes, rows, REGISTER_TOKENS, REGISTER_TARGET_DIM)
+    future_register = background + signal
+
+    def pair_targets() -> PairTargets:
+        return PairTargets(
+            gt_trajectory=torch.randn(scenes, rows, 8, TRAJECTORY_STATE_DIM),
+            gt_valid=torch.ones(scenes, rows, dtype=torch.bool),
+            future_register=future_register.clone(),
+            future_chunk_valid=torch.ones(scenes, rows, REGISTER_TOKENS, dtype=torch.bool),
+            future_quality=torch.ones(scenes, rows, REGISTER_TOKENS),
+            pair_ids=[[{"gt_id": str(index)} for index in range(rows)] for _ in range(scenes)],
+        )
+
+    # (a) pure background reader: every GT row gets the scene's own mean future.  The
+    #     raw cosine is high -- this is the false positive -- while the residual is 1.0.
+    background_only = background.expand(scenes, rows, REGISTER_TOKENS, REGISTER_TARGET_DIM).clone()
+    reading = streaming_future_alignment(background_only, pair_targets())
+    assert reading["future_cosine_similarity"] > 0.9
+    assert reading["residual_relative_l1"] == pytest.approx(1.0, abs=1e-5)
+    assert reading["residual_cos_future"] == pytest.approx(0.0, abs=1e-3)
+
+    # (b) half the trajectory signal recovered -> residual 0.5, i.e. the scale is linear
+    #     in how much of the background-free part the model actually got.
+    half = streaming_future_alignment(background + 0.5 * signal, pair_targets())
+    assert half["residual_relative_l1"] == pytest.approx(0.5, abs=1e-5)
+
+    # (c) adding an arbitrary per-scene constant must not move the residual reading at
+    #     all -- that is the whole claim, and it is what "excludes background" means.
+    shifted = streaming_future_alignment(background + 0.5 * signal + 7.0 * background, pair_targets())
+    assert shifted["residual_relative_l1"] == pytest.approx(half["residual_relative_l1"], abs=1e-6)
+
+    # (d) a wrong signal is worse than no signal: above 1.0, mirroring relative_l1's bar.
+    wrong = streaming_future_alignment(background - signal, pair_targets())
+    assert wrong["residual_relative_l1"] > 1.0
+
+    # (e) perfect prediction -> 0.0 and cosine 1.0.
+    perfect = streaming_future_alignment(future_register.clone(), pair_targets())
+    assert perfect["residual_relative_l1"] == pytest.approx(0.0, abs=1e-6)
+    assert perfect["residual_cos_future"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_horizon_resolved_gain_separates_the_frames_that_carry_trajectory_signal():
+    """Per-frame gains must exist for all eight horizons and be individually readable.
+
+    The trajectory-attributable share of a frame rises monotonically with horizon --
+    measured 30.6% of the L1 at +0.5s against 46.9% at +4.0s, and 34.5% against 70.6%
+    of the frame's L2 energy -- because the near future is mostly the scene continuing
+    while the far future is mostly where the trajectory went.  One pooled gain hides
+    which end is moving, and the near end is exactly where a background reader scores
+    best, so a pooled gain can look flat while the far frames are learning.
+    """
+    from nvs_v6_wan_e2e.data import FUTURE_FRAMES
+    from nvs_v6_wan_e2e.stage1_eval import CONDITIONING_SUMMARY_KEYS, future_fit_metrics
+
+    class Canned(nn.Module):
+        def __init__(self, predicted: torch.Tensor, trajectories: torch.Tensor) -> None:
+            super().__init__()
+            self.predicted, self.trajectories = predicted, trajectories
+            self.device_probe = nn.Parameter(torch.zeros(1))
+
+        def forward_register_only(self, observation, source, modes):
+            count = source.shape[1]
+            for scene in range(self.predicted.shape[0]):
+                if torch.equal(source[0, 0], self.trajectories[scene, 0]):
+                    return (self.predicted[scene, :count],)
+            raise AssertionError("stub was asked for a scene it does not have")
+
+    class Sample:
+        def __init__(self, scene_id: str, observation, targets) -> None:
+            self.scene_id, self.observation, self.targets = scene_id, observation, targets
+
+    torch.manual_seed(5)
+    scenes, rows = 3, 4
+    future_register = torch.randn(scenes, rows, REGISTER_TOKENS, REGISTER_TARGET_DIM)
+    gt_trajectory = torch.randn(scenes, rows, 8, TRAJECTORY_STATE_DIM)
+    targets = PairTargets(
+        gt_trajectory=gt_trajectory,
+        gt_valid=torch.ones(scenes, rows, dtype=torch.bool),
+        future_register=future_register.clone(),
+        future_chunk_valid=torch.ones(scenes, rows, REGISTER_TOKENS, dtype=torch.bool),
+        future_quality=torch.ones(scenes, rows, REGISTER_TOKENS),
+        pair_ids=[[{"gt_id": str(index)} for index in range(rows)] for _ in range(scenes)],
+    )
+
+    def slice_scene(batched: PairTargets, scene: int) -> PairTargets:
+        return PairTargets(**{
+            key: (value[scene : scene + 1] if isinstance(value, torch.Tensor) else [value[scene]])
+            for key, value in batched.__dict__.items()
+        })
+
+    samples = [
+        Sample(f"scene{scene}", make_observation(1), slice_scene(targets, scene)) for scene in range(scenes)
+    ]
+
+    summary = future_fit_metrics(samples, Canned(future_register.clone(), gt_trajectory), None, None)
+    for frame in range(1, FUTURE_FRAMES + 1):
+        key = f"mean_frame{frame}_gain_over_scene_mean"
+        assert key in summary, f"the horizon-resolved gain is missing {key}"
+        # A perfect register beats the scene-mean anchor by 100% at every horizon.
+        assert summary[key] == pytest.approx(1.0, abs=1e-5)
+        assert key not in CONDITIONING_SUMMARY_KEYS  # per-frame detail, not a headline
+    assert summary["mean_residual_relative_l1"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_paired_contrast_loss_is_invariant_to_the_scene_background():
+    """The contrast term must see only what the trajectories differ in.
+
+    Measured on 400 cached scenes the scene mean of the register target carries 59.8% of
+    the L1 objective, and on the rendered pixels 79.5% of the future's variance is fixed
+    by the scene before any trajectory is read.  ``identity_future_l1`` cannot avoid
+    paying for that; the paired contrast term cancels it by construction, and this test
+    pins the cancellation rather than the arithmetic: adding an arbitrary per-scene
+    constant to every GT row of a prediction must leave the contrast loss bit-identical,
+    while the plain identity loss must move.
+    """
+    from nvs_v6_wan_e2e.losses import identity_future_l1, paired_contrast_future_l1
+
+    torch.manual_seed(21)
+    targets = make_targets(batch=3, gt=4)
+    predicted = targets.future_register + 0.3 * torch.randn_like(targets.future_register)
+    base_contrast = paired_contrast_future_l1(predicted, targets)
+    base_identity = identity_future_l1(predicted, targets)
+
+    # (a) a per-scene constant added to every row: pure background, invisible to the
+    #     contrast term, very visible to the identity term.
+    offset = torch.randn(3, 1, REGISTER_TOKENS, REGISTER_TARGET_DIM) * 5.0
+    shifted = paired_contrast_future_l1(predicted + offset, targets)
+    assert shifted == pytest.approx(float(base_contrast), abs=1e-5)
+    assert identity_future_l1(predicted + offset, targets) != pytest.approx(
+        float(base_identity), abs=1e-3
+    )
+
+    # (b) a perfect predictor scores zero on the contrast term.
+    assert paired_contrast_future_l1(targets.future_register.clone(), targets) == pytest.approx(0.0, abs=1e-6)
+
+    # (c) a trajectory-blind predictor (one row repeated) scores the target's own spread,
+    #     not zero: the term does not reward ignoring the trajectory.
+    blind = targets.future_register.mean(dim=1, keepdim=True).expand_as(targets.future_register)
+    blind_loss = paired_contrast_future_l1(blind, targets)
+    assert float(blind_loss) > 0.1
+
+    # (d) a single-GT scene has no pair: the zero must still carry the graph, so DDP's
+    #     reducer keeps seeing every parameter with a gradient.
+    single = make_targets(batch=1, gt=1)
+    pred_single = single.future_register.clone().requires_grad_(True)
+    zero = paired_contrast_future_l1(pred_single, single)
+    assert float(zero) == 0.0
+    zero.backward()
+    assert pred_single.grad is not None and bool((pred_single.grad == 0).all())
+
+    # (e) the target is detached: the contrast term must not back-prop into the cache.
+    grad_target = make_targets(batch=1, gt=2)
+    grad_target.future_register = grad_target.future_register.clone().requires_grad_(True)
+    pred_grad = torch.randn_like(grad_target.future_register, requires_grad=True)
+    paired_contrast_future_l1(pred_grad, grad_target).backward()
+    assert grad_target.future_register.grad is None
+    assert pred_grad.grad is not None
 
 
 def test_future_loss_respects_frame_mask_and_detached_target():
@@ -3537,3 +3837,114 @@ def test_scene_labels_reads_multigt_labels_without_decoding_video(tmp_path):
         trajectory.mkdir()
         (trajectory / "metadata.json").write_text('{"trajectory_label": "%s"}' % label)
     assert scene_labels(tmp_path) == ["human_log", "stop", "human_log"]
+
+
+def _paired_pos_neg_caches(tmp_path: Path, tokens: list[str], pos_gt: int = 2, neg_gt: int = 3):
+    """A positive and a negative Stage-0 cache sharing ONE standardizer.
+
+    Sharing is the whole point: ``TargetStandardizer.fingerprint`` hashes the fitted
+    mean/scale, so two caches fitted separately live in two target spaces and their
+    rows cannot be concatenated behind one head.  Both roots are written with the
+    real ``save_standardizer`` and both payload sets carry that fingerprint, which is
+    what the dataset's construction-time guard compares.
+    """
+
+    from nvs_v6_wan_e2e.teacher import TargetStandardizer
+
+    standardizer = TargetStandardizer(feature_dim=REGISTER_TARGET_DIM)
+    standardizer.fit(torch.randn(3, 2, REGISTER_TOKENS, REGISTER_TARGET_DIM), "+".join(tokens[:3]))
+    fingerprint = standardizer.fingerprint()
+    positive = _synthetic_stage1_cache(tmp_path / "pos", tokens, fingerprint=fingerprint, gt_count=pos_gt)
+    negative = _synthetic_stage1_cache(tmp_path / "neg", tokens, fingerprint=fingerprint, gt_count=neg_gt)
+    for root in (positive, negative):
+        save_standardizer(root, standardizer, {"fit_scene_ids": tokens[:3]})
+    return positive, negative, fingerprint
+
+
+def test_negative_cache_rows_append_after_positives_without_reaching_the_model(tmp_path):
+    """Mined negatives join the *training* rows only, positives first and unchanged.
+
+    Three contracts:
+    (a) with ``negative_target_cache_root=None`` the item is exactly what it was
+        before the flag existed, so a positive-only run does not move;
+    (b) a merged item is the positive rows followed by the negative cache's own,
+        each bit-identical to its source, so a row's provenance is its position;
+    (c) row kind never becomes a tensor.  ``negative_rows`` exists only in
+        ``camera_metadata``; every supervised tensor keeps the positive-only
+        trailing shape.  That is what stops a merged batch from handing the network
+        a per-row "am I a negative" code -- the shortcut ``stage1_step`` zeroes the
+        mode code to make structurally unavailable.
+    """
+
+    from nvs_v6_wan_e2e.target_cache import Stage1SceneDataset, collate_stage1_batch, scene_target_path
+
+    tokens = [f"{index:016x}" for index in range(8)]
+    positive, negative, fingerprint = _paired_pos_neg_caches(tmp_path, tokens)
+    kwargs = dict(image_hw=(32, 48), target_fingerprint=fingerprint)
+    plain = Stage1SceneDataset(tokens, positive, **kwargs)
+    merged = Stage1SceneDataset(tokens, positive, negative_target_cache_root=negative, **kwargs)
+    negatives_only = Stage1SceneDataset(tokens, negative, **kwargs)
+
+    plain_item, merged_item = plain[0], merged[0]
+    assert plain_item["gt_valid"].shape[0] == 2
+    assert plain_item["negative_rows"] == 0
+    assert merged_item["gt_valid"].shape[0] == 5, "2 positive + 3 negative rows"
+    assert merged_item["negative_rows"] == 3
+
+    # (b) positives first and untouched, negatives exactly as their own cache holds them
+    row_keys = Stage1SceneDataset.NEGATIVE_ROW_KEYS
+    for key in row_keys:
+        assert torch.equal(merged_item[key][:2], plain_item[key]), key
+        assert torch.equal(merged_item[key][2:], negatives_only[0][key]), key
+    assert merged_item["labels"][:2] == plain_item["labels"]
+    assert all(label.startswith("neg:") for label in merged_item["labels"][2:])
+
+    # (a) the observation side is not part of the merge at all
+    for key in ("rgb_history", "history_valid", "ego_history", "route_command",
+                "relative_ego_poses", "scene_id", "degenerate_multi_gt"):
+        assert torch.equal(merged_item[key], plain_item[key]) if torch.is_tensor(plain_item[key]) else (
+            merged_item[key] == plain_item[key]
+        ), key
+
+    # (c) mixed K across a batch pads to the widest scene and masks the padding
+    plain_dataset_second = plain[1]
+    negative_payload = scene_target_path(negative, tokens[1])
+    negative_payload.unlink()
+    assert merged[1]["gt_valid"].shape[0] == 2, "a scene with no negative payload keeps its positives"
+    assert merged[1]["negative_rows"] == 0
+    observation, targets, scene_ids = collate_stage1_batch([merged_item, merged[1]])
+    assert targets.gt_trajectory.shape == (2, 5, 8, 3)
+    assert targets.gt_valid.tolist() == [[True] * 5, [True, True, False, False, False]]
+    assert not targets.future_chunk_valid[1, 2:].any(), "padded rows are masked, not zero-supervised"
+    assert [entry["negative_rows"] for entry in observation.camera_metadata] == [3, 0]
+    for tensor in (targets.gt_trajectory, targets.future_register, targets.future_quality):
+        assert tensor.shape[1] == 5 and tensor.shape[2:] != (5,), tensor.shape
+    assert scene_ids == [tokens[0], tokens[1]]
+    del plain_dataset_second
+
+
+def test_negative_cache_rejects_a_different_target_space(tmp_path):
+    """A negative cache fitted separately is a hard error, not a silent mixture.
+
+    Checked at construction rather than per scene because ``__getitem__`` retries the
+    next token on any exception: a per-scene raise would surface as "could not load
+    any scene near index" and hide the real cause.
+    """
+
+    from nvs_v6_wan_e2e.teacher import TargetStandardizer
+    from nvs_v6_wan_e2e.target_cache import Stage1SceneDataset
+
+    tokens = [f"{index:016x}" for index in range(8)]
+    positive, negative, fingerprint = _paired_pos_neg_caches(tmp_path, tokens)
+    kwargs = dict(image_hw=(32, 48), target_fingerprint=fingerprint)
+    # The pair that shares one standardizer constructs *and* merges.
+    assert Stage1SceneDataset(tokens, positive, negative_target_cache_root=negative, **kwargs)[0]["negative_rows"] == 3
+
+    other = TargetStandardizer(feature_dim=REGISTER_TARGET_DIM)
+    other.fit(torch.randn(3, 2, REGISTER_TOKENS, REGISTER_TARGET_DIM) * 7.0 + 3.0, "+".join(tokens[:3]))
+    foreign = _synthetic_stage1_cache(tmp_path / "foreign", tokens, fingerprint=other.fingerprint(), gt_count=2)
+    save_standardizer(foreign, other, {"fit_scene_ids": tokens[:3]})
+    assert other.fingerprint() != fingerprint
+
+    with pytest.raises(ValueError, match="standardized as"):
+        Stage1SceneDataset(tokens, positive, negative_target_cache_root=foreign, **kwargs)

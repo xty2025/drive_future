@@ -18,7 +18,7 @@ from typing import Any, Protocol, Sequence, runtime_checkable
 import numpy as np
 import torch
 
-from .data import Observation, PairTargets
+from .data import FUTURE_FRAMES, Observation, PairTargets, REGISTER_TOKENS
 from .model import DirectedPairDiT
 from .target_cache import observation_to_device
 
@@ -74,12 +74,15 @@ def trajectory_spread(trajectories: torch.Tensor) -> float:
 
 
 #: The headline before/after summary: the L1, the tightest model-independent baseline,
-#: the model-side trajectory-blind control, and the two direct "how far from the real
-#: future" readings (cosine similarity and the dimensionless relative L1).
+#: the model-side trajectory-blind control, the two direct "how far from the real
+#: future" readings (cosine similarity and the dimensionless relative L1), and the two
+#: background-removed readings that isolate the part only the trajectory can explain.
 CONDITIONING_SUMMARY_KEYS = (
     "mean_paired_future_l1",
     "mean_future_cosine_similarity",
     "mean_future_relative_l1",
+    "mean_residual_relative_l1",
+    "mean_residual_cos_future",
     "mean_scene_mean_target_l1",
     "mean_trajectory_blind_l1",
     "mean_trajectory_conditioning_fidelity",
@@ -224,6 +227,66 @@ def future_fit_metrics(
         # being scored does not have.
         scene_mean = (own_target * weights.unsqueeze(-1)).sum(dim=0) / weights.sum(dim=0).clamp_min(1e-8).unsqueeze(-1)
 
+        # Background-removed reading.  Measured on 400 cached scenes, the scene mean is
+        # not a small nuisance term: it accounts for 79.3% of the target's raw L2 energy
+        # (11.8% per-token global DC + 67.5% scene-specific) and buying it alone takes
+        # the L1 from 0.792 (predict zero) to 0.318, i.e. 59.8% of the entire objective.
+        # Only the remaining 40.2% can come from reading the trajectory.  So the raw
+        # ``future_cosine_similarity`` is dominated by a direction the model gets right
+        # for free -- a failed 8-token run read cos 0.6555 while both gains were
+        # negative.  Subtracting each side's *own* scene mean leaves only what the
+        # trajectory could have caused, and it is calibrated where cosine is not: a
+        # register that reads the scene and ignores the trajectory has zero residual on
+        # both sides, so ``residual_relative_l1`` lands on exactly 1.0.  Below 1.0 is
+        # the first honest evidence of trajectory-conditional prediction.
+        weight_sum = weights.sum(dim=0).clamp_min(1e-8).unsqueeze(-1)
+        prediction_scene_mean = (predicted * weights.unsqueeze(-1)).sum(dim=0) / weight_sum
+        prediction_residual = predicted - prediction_scene_mean
+        target_residual = own_target - scene_mean
+        anchor_l1 = weighted_error(scene_mean.expand_as(own_target), own_target)
+        residual_l1 = weighted_error(prediction_residual, target_residual)
+        # Both residual readings need at least two GT rows.  With one row the scene mean
+        # *is* that row, so ``anchor_l1`` is ``(x*w)/w`` rounding (~1e-7) rather than an
+        # exact zero and a ``> 0`` test would divide one noise quantity by another.
+        residual_defined = gt_count > 1 and anchor_l1 > 1e-6
+        residual_cosines = []
+        # A single-GT scene has no within-scene variation to explain: its scene mean
+        # *is* its only target, so both residuals are identically zero and their cosine
+        # is undefined rather than bad.  Guarded exactly like ``trajectory_blind_l1``
+        # and ``shuffled_pair_l1`` below, so ``nanmean`` drops the scene instead of
+        # letting a structurally empty one drag the reading down.
+        if residual_defined:
+            for row in range(gt_count):
+                valid = chunk_valid[row]
+                if not bool(valid.any()):
+                    continue
+                residual_cosines.append(
+                    float(
+                        torch.nn.functional.cosine_similarity(
+                            prediction_residual[row, valid].float(), target_residual[row, valid].float(), dim=-1
+                        ).mean()
+                    )
+                )
+
+        # Horizon-resolved gain.  The trajectory-attributable share of a frame rises
+        # monotonically with horizon -- measured 30.6% of the L1 at +0.5s against 46.9%
+        # at +4.0s -- because the near future is mostly the scene continuing and the far
+        # future is mostly where the trajectory went.  A single pooled gain hides which
+        # end is moving, and the near end is where a background reader scores best.
+        queries_per_frame = REGISTER_TOKENS // FUTURE_FRAMES
+        token_error = (predicted - own_target).abs().mean(dim=-1)
+        token_anchor = target_residual.abs().mean(dim=-1)
+        frame_gains = []
+        for frame in range(FUTURE_FRAMES):
+            slab = slice(frame * queries_per_frame, (frame + 1) * queries_per_frame)
+            frame_weight = weights[:, slab].sum()
+            if float(frame_weight) <= 0:
+                frame_gains.append(float("nan"))
+                continue
+            paired = float((token_error[:, slab] * weights[:, slab]).sum() / frame_weight)
+            anchor = float((token_anchor[:, slab] * weights[:, slab]).sum() / frame_weight)
+            frame_gains.append((anchor - paired) / anchor if anchor > 0 else float("nan"))
+
         mean_errors, constant_errors = [], []
         if mean_target is not None:
             reference = mean_target.to(predicted.device)
@@ -244,7 +307,11 @@ def future_fit_metrics(
                     paired_l1 / target_magnitude if target_magnitude > 0 else float("nan")
                 ),
                 "target_abs_mean": target_magnitude,
-                "scene_mean_target_l1": weighted_error(scene_mean.expand_as(own_target), own_target),
+                "scene_mean_target_l1": anchor_l1,
+                "residual_l1": residual_l1 if residual_defined else float("nan"),
+                "residual_relative_l1": residual_l1 / anchor_l1 if residual_defined else float("nan"),
+                "residual_cos_future": float(np.mean(residual_cosines)) if residual_cosines else float("nan"),
+                **{f"frame{frame}_gain_over_scene_mean": value for frame, value in enumerate(frame_gains, start=1)},
                 "constant_target_l1": float(np.mean(constant_errors)) if constant_errors else float("nan"),
                 "shuffled_pair_l1": (
                     weighted_error(predicted, torch.roll(own_target, -1, dims=0)) if gt_count > 1 else float("nan")
@@ -324,9 +391,46 @@ def streaming_future_alignment(predicted: torch.Tensor, targets: PairTargets) ->
     has_magnitude = (has_scene > 0) & (magnitude > 0)
     rel_mask = has_magnitude.to(pred.dtype)
 
+    # The background-removed twin, cheap enough to log every step.  Subtracting each
+    # side's own per-scene mean leaves only what the trajectory could have caused, so
+    # 1.0 is exactly "reads the scene, ignores the trajectory" -- the reading the raw
+    # cosine cannot give because the scene mean carries 59.8% of the L1 objective.
+    scene_weight = weights.sum(dim=1).clamp_min(1e-8).unsqueeze(-1)
+    pred_residual = pred - (pred * weights.unsqueeze(-1)).sum(dim=1, keepdim=True) / scene_weight.unsqueeze(1)
+    target_residual = own_target - (own_target * weights.unsqueeze(-1)).sum(dim=1, keepdim=True) / scene_weight.unsqueeze(1)
+    residual_error = (pred_residual - target_residual).abs().mean(dim=-1)
+    residual_numerator = (residual_error * weights).sum(dim=(1, 2))
+    residual_magnitude = (target_residual.abs().mean(dim=-1) * weights).sum(dim=(1, 2))
+    per_scene_residual_rel = residual_numerator / residual_magnitude.clamp_min(1e-8)
+    # Degeneracy is decided by the *row count*, not by a magnitude threshold.  A scene
+    # with one valid GT row has a scene mean equal to that row, so both residuals are
+    # zero in exact arithmetic -- but the mean is formed as ``(x*w)/w``, which leaves
+    # ~1e-7 of rounding, and a ``> 0`` test then admits a scene whose cosine is pure
+    # float noise (measured 0.0547 against 0.82 for its siblings, enough to move a
+    # four-scene average by 0.19).  ``future_fit_metrics`` guards the same case with
+    # ``gt_count > 1``; this is its vectorized equivalent.
+    residual_mask = (token_valid.any(dim=-1).sum(dim=-1) >= 2) & (residual_magnitude > 1e-6)
+
+    residual_cosine = torch.nn.functional.cosine_similarity(pred_residual, target_residual, dim=-1)
+    residual_per_row = (residual_cosine * token_mask).sum(dim=-1) / token_mask.sum(dim=-1).clamp_min(1.0)
+    # Rows collapse with ``row_mask`` ([B,K]); the scene-level mask is [B] and only
+    # applies when scenes collapse.  Using the [B] mask here instead would broadcast
+    # against the K axis, which is silent whenever B == K and wrong always.
+    per_scene_residual_cos = (residual_per_row * row_mask).sum(dim=-1) / row_mask.sum(dim=-1).clamp_min(1.0)
+    # A scene whose residual magnitude is zero -- a single valid GT row, whose scene
+    # mean *is* its only target -- has an undefined residual cosine rather than a bad
+    # one, so it drops out of both residual readings instead of reading as failure.
+    residual_scene_mask = residual_mask.to(pred.dtype)
+
     return {
         "future_cosine_similarity": float((per_scene_cos * has_scene).sum() / has_scene.sum().clamp_min(1.0)),
         "future_relative_l1": float((per_scene_rel * rel_mask).sum() / rel_mask.sum().clamp_min(1.0)),
+        "residual_relative_l1": float(
+            (per_scene_residual_rel * residual_scene_mask).sum() / residual_scene_mask.sum().clamp_min(1.0)
+        ),
+        "residual_cos_future": float(
+            (per_scene_residual_cos * residual_scene_mask).sum() / residual_scene_mask.sum().clamp_min(1.0)
+        ),
         "valid_scenes": int(has_scene.sum()),
     }
 
@@ -387,6 +491,15 @@ def register_verdict(train: dict[str, Any], evaluation: dict[str, Any] | None, m
         # but "good enough" is anchored by scene_mean_target_l1 below, not by these.
         reported[f"{prefix}_future_cosine_similarity"] = float(metrics["mean_future_cosine_similarity"])
         reported[f"{prefix}_future_relative_l1"] = float(metrics["mean_future_relative_l1"])
+        # The background-removed pair, and the ones to read first.  The scene mean of the
+        # target carries 59.8% of the L1 objective (measured on 400 cached scenes: 0.792
+        # predicting zero -> 0.318 predicting the scene mean), so the raw cosine above is
+        # dominated by a direction a scene reader gets for free -- the retired 8-token run
+        # read cos 0.6555 while both gains were negative.  ``residual_relative_l1`` is
+        # calibrated where cosine is not: 1.0 is exactly "reads the scene, ignores the
+        # trajectory", 0.0 is perfect, and above 1.0 the trajectory made things worse.
+        reported[f"{prefix}_residual_relative_l1"] = float(metrics["mean_residual_relative_l1"])
+        reported[f"{prefix}_residual_cos_future"] = float(metrics["mean_residual_cos_future"])
         # Named for the baseline it actually gates on.  It used to be called
         # beats_trajectory_blind_baseline, which read as a claim about
         # gain_over_trajectory_blind -- a different, weaker control -- and reported

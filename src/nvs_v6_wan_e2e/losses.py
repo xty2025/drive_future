@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -301,6 +302,53 @@ def identity_future_l1(predicted_register: torch.Tensor, targets: PairTargets) -
             )
             if loss is not None:
                 losses.append(loss)
+    if not losses:
+        return predicted_register.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def paired_contrast_future_l1(predicted_register: torch.Tensor, targets: PairTargets) -> torch.Tensor:
+    """Background-free auxiliary: supervise the *difference* between two GT rows of a scene.
+
+    Measured on 400 cached scenes, the per-scene mean of the register target carries
+    **59.8%** of the L1 objective (0.792 predicting zero -> 0.318 predicting the scene
+    mean) and **79.3%** of its raw L2 energy; measured directly on the rendered pixels
+    the same split is **79.5%** background / 20.5% trajectory, and the trajectory share
+    rises from 8.5% at +0.5s to ~25% at +4.0s.  So most of ``identity_future_l1``'s
+    gradient teaches "output this scene's average future", which needs no trajectory at
+    all -- that is why an untrained register sits at ``residual_relative_l1 = 1.0`` and
+    why the raw cosine can read 0.65 on a run whose gains are all negative.
+
+    Subtracting two rows of the same scene cancels that scene mean *exactly*, leaving
+    only what the trajectories differ in, and the contrast target is genuinely
+    trajectory-driven: ``corr(||d_traj||, ||d_reg||)`` is +0.58 Pearson / +0.65 Spearman.
+    The rows are already in the same forward, so this costs one elementwise reduction
+    per pair, not another pass through the trunk.
+
+    The pair weight is the *minimum* of the two rows' quality x validity, so a pair
+    inherits no token either row lacks.  A scene with fewer than two valid rows has no
+    pair and contributes nothing; the zero is built from ``predicted_register`` so the
+    graph stays connected and DDP's reducer still sees every parameter with a gradient.
+    """
+
+    valid = targets.gt_valid.to(predicted_register.device)
+    chunk_valid = targets.future_chunk_valid.to(predicted_register.device)
+    quality = targets.future_quality.to(predicted_register.device, dtype=predicted_register.dtype)
+    target = targets.future_register.to(predicted_register.device)
+    losses: list[torch.Tensor] = []
+    for batch in range(valid.shape[0]):
+        live = torch.nonzero(valid[batch], as_tuple=False).flatten().tolist()
+        for left, right in itertools.combinations(live, 2):
+            weight = torch.minimum(
+                quality[batch, left] * chunk_valid[batch, left].to(quality.dtype),
+                quality[batch, right] * chunk_valid[batch, right].to(quality.dtype),
+            )
+            if float(weight.sum()) <= 0:
+                continue
+            delta_predicted = predicted_register[batch, left] - predicted_register[batch, right]
+            delta_target = target[batch, left] - target[batch, right]
+            error = (delta_predicted - delta_target.detach()).abs().mean(dim=-1)
+            losses.append((error * weight).sum() / weight.sum())
     if not losses:
         return predicted_register.sum() * 0.0
     return torch.stack(losses).mean()

@@ -41,49 +41,105 @@
 
 ## 契约要点（改动时最容易破坏的几处）
 
-- ActionDiT 的自注意力序列是 **`[Scene(81) | Action A(8) | Register R(8)]` 共 97 token**
-  （FastWAM 的布局）。Scene 由 `text_embedding(S(81))` **只 embed 一次**，
-  然后**用两遍**：既拼进自注意力序列，又原样当 cross-attention 的 K/V——这样 Wan 预训练的
-  `cross_attn.q/k/v/o`、`norm_q/norm_k` 看到的输入分布没变，226 key `strict=True` 的加载
-  才仍然有意义。RoPE 按 **FastWAM 的分段约定**铺：每段从 0 重启（Scene `0..80`、
-  Action `0..7`、Register `0..7`）。Action 段必须用 Wan 自己预训练的位置，因为 `head`、
-  `time_queries` 和搬过来的 8 层 block 都是在那个位置上训出来的；Register 与 Action
-  共享相位是**语义正确**而非偷懒——register token `i` 是 `(i+1)×0.5s` 那一帧的未来，
-  action token `i` 是同一时刻的路点。三段刻意重叠的位置靠三个 type embedding
-  （`scene_type_embedding` / `action_type_embedding` / `register_type_embedding`，
-  各自 `randn(1,1,256)×0.02`，在 skip 前缀里保持随机）区分。
-  `Head` 读 `x[:, 81:89]` 出 flow velocity，`future_head` 读 `x[:, 89:]` 出预测 register。
-  不同 candidate 之间永不互相 attend（每条 candidate 自己一份 97）。
-  `predict_future=False` 时 register 整段不进序列，变成 `[Scene | Action]` = 89 token，
-  两张 mask 表都退化成同一个左上角 2×2，所以两段的场景不需要特判。
-- **自注意力带 per-stage 的 segment mask，两个阶段不能用同一张表**
+- ActionDiT 的自注意力序列是 **`[Scene(81) | Action A(8) | Register R(32)]` 共 121 token**。
+  Scene 由 `text_embedding(S(81))` **只 embed 一次**，然后**用两遍**：既拼进自注意力序列，
+  又原样当 cross-attention 的 K/V——这样 Wan 预训练的 `cross_attn.q/k/v/o`、`norm_q/norm_k`
+  看到的输入分布没变，226 key `strict=True` 的加载才仍然有意义。**cross-attention 的
+  K/V 只有 Scene**，register 从不进去，所以它不可能是 Action 读到未来的第二条路。
+  Register 段是 `8 未来帧 × REGISTER_QUERIES_PER_FRAME=4` = **32 token**（旧记录里的
+  `R(8)` / 97 token 是 8-token 时代，已作废）。
+  RoPE 按分段约定铺：**每段从 0 重启**。Scene 取 `rope_for(81)`、Action 取 `rope_for(8)`
+  （必须用 Wan 自己预训练的位置，因为 `head`、`time_queries` 和搬过来的 8 层 block 都是在
+  那个位置上训出来的），Register 取 `register_rope(32)` = `rope_for(8).repeat_interleave(4)`
+  ——**每帧的 4 个 query 共享该帧的相位**，而不是 `0..31` 顺数。顺数会把一帧的四个 query
+  放到四个不同时刻、并把 register 段拉得比 action 段长，破坏"register token `q+4f` 对应
+  action token `f`（即 `(f+1)×0.5s`）"这个一一对应。同帧四个 query 靠 `future_queries`
+  和 `register_type_embedding` 区分；**RoPE 只携带时间**。
+  三段刻意重叠的位置靠三个 type embedding（`scene_type_embedding` / `action_type_embedding`
+  / `register_type_embedding`，各自 `randn(1,1,256)×0.02`，在 skip 前缀里保持随机）区分。
+  `Head` 读 `x[:, 81:89]` 出 flow velocity，`future_head` 读 `x[:, 89:]` 出预测 register
+  （32 行 × Teacher 自己的 1024 宽）。不同 candidate 之间永不互相 attend（每条 candidate
+  自己一份 121）。`predict_future=False` 时 register 整段不进序列，变成 `[Scene | Action]`
+  = 89 token，单表退化成左上角 2×2，不需要特判；实测此时 velocity 与带 register 时相差
+  **8.1e-10**（相对 3.2e-07 ≈ 2.7× float32 eps），是 SDPA 在不同序列长度下的累加噪声，
+  **不是**信息流——同一输入重跑逐位相同，register 输入从全零换到 1e3 量级 velocity 也
+  逐位相同。
+- **自注意力只有一张 segment mask，Stage 1 / Stage 2 / 部署推理完全共用，没有 stage 参数**
   （`NvsActionDiT.SEGMENT_VISIBILITY`，行=query、列=key，1=可读）：
 
-  | query\key | Scene | Action | Register | | query\key | Scene | Action | Register |
-  |---|---|---|---|---|---|---|---|---|
-  | **Stage 1** Scene | ✓ | ✗ | ✗ | | **Stage 2** Scene | ✓ | ✗ | ✗ |
-  | Action | ✓ | ✓ | ✗ | | Action | ✓ | ✓ | ✓ |
-  | Register | ✓ | ✓ | ✓ | | Register | ✓ | ✗ | ✓ |
+  | query\key | Scene | Action | Register |
+  |---|---|---|---|
+  | Scene | ✓ | ✗ | ✗ |
+  | Action | ✓ | ✓ | **✗** |
+  | Register | ✓ | ✓ | ✓ |
 
-  Stage 1 学的是 `(Scene, Action) → Register`，Register 是**预测目标**，所以
-  `Register → Action` 必须关掉，否则等于拿未来去训动作、目标泄漏进本该预测它的那条流。
-  Stage 2 是 future-conditioned planning，箭头**反过来**：`Register → Action` 打开、
-  `Action → Register` 关掉，这样 `R_pred` 始终是一个独立的 `(Scene, Mode) → R` 估计，
-  而不是它即将去条件化的那条轨迹的描述。**两个阶段 Scene 都只读自己**——Scene 是
-  scorer 的 K/V，所以 ActionDiT 永远不写 scorer 消费的那批 token
-  （`scene_written_by_action_dit: false`）。
-  **这个反转有一个必须写在脸上的代价**：register 的条件化在两个阶段**不一样**
-  （Stage 1 能读 Action，Stage 2 不能），所以 **Stage 2 的 `loss_future` 量的不是
-  Stage 1 训练的那个函数**，两者的数值不可直接对比，Stage 2 里它回升也不代表
-  Stage 1 白训了。这是"两张 mask"这个要求的固有后果，不是实现缺陷——`_flow_pass`
-  的 docstring 里也写明了。
-  `attention_stage` 在 `NvsActionDiT.forward` 和 `_flow_pass` 上都是**必填位置参数**，
-  故意不给默认值：给了默认值就等于允许某个阶段悄悄跑成另一个阶段的信息流。
-  入口与阶段是 1:1 的——`forward_register_only → stage1`，`forward_flow / forward_pairs → stage2`。
-  每张表的对角块都是全可见的，所以不存在全 `-inf` 的 softmax 行（加 mask 唯一会静默产出
-  NaN 的方式），契约测试用 `mask.any(dim=-1).all()` 钉住。
+  即 `((1,0,0),(1,1,0),(1,1,1))`。**硬不变量：Action 永远读不到 Register（未来）**，
+  两个 stage 都一样。Register 读 Action 是必需的——那是 `(Scene, Action) → Future` 这条
+  轨迹条件通路本身；关掉它会让 register 在同一场景的 K 条 GT 上逐位相同，把
+  `paired_future_l1` 钉在 `scene_mean_target_l1` 地板上、`gain_over_trajectory_blind`
+  恒为 0（实测 depth-2 trunk 上关掉该条目 cross-GT `max|dRegister| = 0.0`，打开是 `7.5e-3`）。
+  Scene 只读自己，所以 ActionDiT 永不写 scorer 消费的那批 token；`_flow_pass` 返回的
+  `scene` 就是 eta 的精修输出，DiT 内部的 scene token 从不外泄（`readout = x[:, 81:]`）。
+
+  **旧版"两张 per-stage 表 + `attention_stage` 必填位置参数 + Stage 2 反转箭头"已整体作废**，
+  连同 `STAGE1_/STAGE2_SEGMENT_VISIBILITY`、`attention_stage_of` 一起删除；`config.py` 的
+  严格 loader 现在**拒绝**这些键重新出现在 yaml 里。三个入口
+  （`forward_register_only` / `forward_flow` / `forward_pairs`）都走同一个 `_flow_pass`，
+  一次 forward、一张 mask。
+
+  行为级验证（生产 geometry，`num_heads=4 / depth=8 / R=32 / D=1024`，2026-10-18 实测）：
+  register 输入扰动 100× → velocity `max|diff| = 0.000e+00` **逐位相同**；
+  `d velocity.sum() / d register输入` **恰为全零**；`future_head` 与 `future_queries`
+  从 velocity 拿到的梯度为 **False**；反向对照把表改成全可见后同一扰动使 velocity 变化
+  `1.2e-04`（≈|v|max 的 17%），证明这些零**不是空断言**、mask 确实是唯一屏障。
+  同一次探测里 `d register / d action = 7.2e-01`、扰动 action 使 register 变化 `3.1e-02`，
+  即轨迹条件通路是活的。
+  对角块全可见，所以不存在全 `-inf` 的 softmax 行（加 mask 唯一会静默产出 NaN 的方式），
+  契约测试用 `mask.any(dim=-1).all()` 钉住。
   **注意 bool 语义方向**：SDPA 的 `attn_mask` 里 `True = 允许`，而
   `nn.MultiheadAttention` 的 `attn_mask` 里 `True = 禁止`，两者相反，别混用。
+  **`loss_future` 跨 stage 仍不可直接比数**，但原因换了：不再是 mask 反转，而是
+  Stage 1 跑 `timestep=0` + clean GT 轨迹、Stage 2 跑随机 `sigma` + 加噪轨迹，而
+  timestep 经 adaLN 调制每个 block——实测 condition 扰动自身量级会使 register 输出变化
+  **44%** 的 `|register|`。函数是同一个，工作点不是。
+- **Stage 1 的 loss 是 `identity_future_l1` + `lambda_contrast × paired_contrast_future_l1`
+  （`--lambda-contrast` 默认 1.0，0 退回纯 identity）。** 加对比项是因为背景在目标里占的
+  比重是**实测**出来的，不是猜的：400 个缓存场景上，target 的场景均值占原始 L2 能量的
+  **79.28%**（11.83% 全局 per-token DC + 67.46% 场景特有），占 L1 目标的 **59.8%**
+  （预测全零 0.7921 → 预测场景均值 0.3184）；直接在渲染像素上量（`scripts/probe_future_background.py`，
+  12 场景）是 **90.43% 背景 / 9.57% 轨迹**，且随时域单调：+0.5s 背景 97.35% → +4.0s 83.89%。
+  所以纯 identity L1 的大部分梯度在教"输出这个场景的平均未来"，那不需要读轨迹——这正是
+  未训练 register 的 `residual_relative_l1` 恰好等于 1.0、以及失败跑 cos 能读 0.65 而 gain 全负
+  的原因。对比项监督同场景两条 GT 行的**差**，场景均值被精确消掉；其目标确实由轨迹驱动
+  （`corr(||Δtraj||, ||Δreg||)` = +0.58 Pearson / +0.65 Spearman），且 K 行已在同一次 forward 里，
+  不付额外前向。
+  **去背景不能靠减常数或固定线性投影**，两条实测否证：按 `||Δtraj||` 分 5 个分位桶，桶内
+  `Δreg` 方向平均 cos = **−0.002**（同一条轨迹差在不同场景里方向完全不同 → 映射是
+  scene-conditional 的）；`Δreg` 近各向同性（pc1 仅 0.5%、前 64 主成分共 14.1%），不存在可隔离的
+  低维轨迹子空间。全局线性探针 `GT轨迹(24维) → 场景内残差` 的 R² = **−0.03**（等于零），
+  换成配对差分后 ridge → 前 8 主成分 R² = **+0.113**。
+  **逐帧读数**：`mean_frame{1..8}_gain_over_scene_mean` 在 verdict 里逐时域给出，能看出学习
+  发生在近端（背景主导）还是远端（轨迹主导）。
+- **`trajectory_gates`：register 到 action 的单向帧对齐通路（#58 的结构性修复）。**
+  实测（真实 DINOv3 scene 流、生产 geometry）register 行在自注意力里只给 8 个 action key
+  **8-10%** 的质量（scene 81 个 key 拿 61-66%、register 自己 24-31%），而 register 的**输入**
+  按构造与轨迹无关（`future_queries` + ego），所以轨迹只能经一条每跳 ~9% 的通道抵达未来读出，
+  8 层复合成 `trajectory_conditioning_fidelity ≈ 5e-4` 的 583× 衰减。
+  **过拟合探针证明瓶颈在通路而不在目标**：6 场景 80 步、lr 2e-4，开/关对比项的两次跑在所有
+  共享读数上逐位相同，`residual_relative_l1` 都钉在 1.00000、fidelity 5e-5、`learned=False`
+  ——连"精确监督跨 GT 差"的对比项都推不动它。
+  修复是每个 block 一个 `TrajectoryGate`：register 查询、action 作 K/V 的 cross-attention，
+  带**帧对齐掩码**（行 `q + Q*f` 只允许 action token `f`，把 RoPE 相位"暗示"的 1:1 对应做成
+  结构）。没有掩码时 gate 的 softmax 在 8 个 action 行上近似均匀，每条 register 行读到的是
+  **平均轨迹**，行间仍逐位相同（实测 resid_rel 依旧 1.0）——掩码是它生效的必要条件。
+  `o` 用 `normal_(std=1e-2)` 而非零初始化：register 分支本就随机初始化，零初始化保护的
+  "预训练状态"不存在，而零初始化实测把整个 warmup 浪费在等 `o` 长到 ~4e-3。
+  实测效果：`d register/d action` 从无 gate 的 9.7e-2 升到 **3.14（32×）**；未训练时 register
+  跨 GT 行差异从 ~1e-4 升到 **0.4318**。
+  **不变量保持**：gate 只写 register 切片，scene/action token 原样穿过，所以
+  `Action 永不读 Register` 在结构上仍成立（扰动 register 输入 100× → velocity 逐位不变、
+  `d velocity/d register输入` 恰为全零，契约测试钉住）。gate 在 `BACKBONE_SKIP_PREFIXES`
+  里（Wan payload 没有它），`predict_future=False` 时冻结以免 DDP reducer 报未用参数。
 - **`_split` 必须 transpose，不能 view**：`q/k/v` 出来是 `[B, L, H*D]`，即
   (token, head, dim) 顺序，所以拆头要 `view(B, L, H, D).transpose(1, 2)`。
   写成 `view(B, H, L, D)` 会把连续缓冲区**重新解释**，交给 SDPA 的每个"query 位置"
@@ -94,51 +150,53 @@
   单位 mask 断言"query `i` 的输出逐位独立于其它行的输入"，
   `test_the_per_stage_masks_block_the_leak_in_both_directions_of_autograd` 再对
   两个阶段各做一遍前向扰动 + 反向梯度，共 4 条箭头。**改注意力实现前先跑这两个。**
-- **未来条件反向辅助动作**（`future_fuse`）：θ 的一份**冻结 EMA 副本**
-  （`EMA_DECAY = 0.996`，约 250 步滞后）在 **stage2 mask 下**先跑一遍，产出
-  `teacher_register`——用 stage2 表是为了让教师那份 register 与动作无关，正好就是
-  spec 里的 `(Scene, Mode) → R_pred`。`future_fuse` 把它 cross-attend 进 **Action token**
-  （不是 Scene：Stage 2 的表规定 Scene 不接受未来修改，而 Scene 又是 scorer 的 K/V），
-  **学生** θ 再消费融合后的 Action。教师/学生这个不对称把环路切开：学生自己的 register
-  永远不参与条件化它的那份张量。
-  **两侧宽度不同**：query 是 `d_model=256` 的 action 流，K/V 是 `register_target_dim=1024` 的
-  EMA register，所以 `nn.MultiheadAttention` 必须给 `kdim`/`vdim`（`in_proj_weight` 因此是
-  `None`，换成 `q/k/v_proj_weight` 三个矩阵），LayerNorm 也必须是两个
-  （`future_fuse_norm` 在 action 侧、`future_fuse_hint_norm` 在 register 侧）。
-  共用一个 `LayerNorm(d_model)` 不是"改个 normalized_shape"能补的形状错误，而是在错的轴上归一化。
-  `future_fuse.out_proj` 的 weight/bias **零初始化**，所以 step 0 与"没开 EMA"逐位相同——和
-  `Head.HEAD_INIT_STD = 1e-3 / ODO_METRIC_JACOBIAN_MAX` 同一套保 anchor 哲学；
-  但 `out_proj.weight` 自身立刻拿到梯度，不是死启动。
-  **`future_fuse` 本身就是 `Register → Action` 通道**，也就是 Stage 1 那张 mask 存在的
-  唯一理由要关掉的那条箭头，所以它在 Stage 1 **既不跑也被冻结**（`_flow_pass` 里
-  `attention_stage == "stage2"` 才融合；`_set_generator_trainability` 在 stage 1 或
-  `predict_future=False` 时冻结 `future_fuse*`）——冻结同时也消除了"可训练但无梯度"，
-  正是 DDP reducer 在 `find_unused_parameters=False` 下拒绝的东西。
-  刻意**没有**把 `teacher_register` 当作学生 register 段的输入：那样 `future_head`
-  可以学成一个平凡拷贝，`loss_future` 直接退化。
-  **scorer 拿到的 `PairOutputs.scene_context` 逐位等于 η 精修后的未融合 Scene**
-  （`test_scorer_scene_kv_stays_unfused_and_the_teacher_receives_no_gradient` 钉住），
-  被未来改写过的只有 Action 段。
-- **Stage 2 的 mask 关掉了 `Action → Register`，这是一个要如实记录的后果**：register 的
-  条件化在两个阶段并不相同，所以 Stage 2 里的 `loss_future` 度量的**不是** Stage 1 训练的
-  那个函数。这不是 bug，是 spec 要求的取舍（`R_pred` 必须独立于它要条件化的轨迹），
-  但看 Stage 2 的 `loss_future` 曲线时不要把它当成 Stage 1 的延续。
-- EMA 副本用 `object.__setattr__(self, "_ema_theta", ...)` 挂在模块字典外面，因此对
-  `state_dict()` / `parameters()` / `named_modules()` / DDP **全部不可见**；`_apply` 被
-  重写，`.to()` / `.double()` / `.cuda()` 会传导过去。**所有 rank 都必须自己调
-  `enable_ema()`**（DDP 不广播它）。checkpoint 里 `ema_theta` 是**独立的顶层条目**，
-  绝不并进 `"model"`；`restore_ema(None)` 表示旧 payload，快照当前 θ 并返回 `False`。
+- **`future_fuse` 与 EMA 教师已整体删除，不要加回来。** 它曾经就是一条显式的
+  `Register → Action` 残差：θ 的一份冻结 EMA 副本先在 stage2 表下跑一遍产出
+  `teacher_register`，再 cross-attend 进 Action token。那正是"Action 不能看见未来"这条
+  硬不变量要关掉的箭头，用一个旁路把它重新打开，mask 就形同虚设。删除后未来对动作的影响
+  **只剩一条路**：`loss_future` 的梯度塑造 Action 流与 register 段**共享的那 8 个 Wan
+  block**，前向上未来永不抵达 action token。
+  连带删除的还有 `_ema_theta` / `enable_ema()` / `update_ema()` / `restore_ema()` 与
+  checkpoint 里的 `ema_theta` 顶层条目。三处守卫钉住它们不会悄悄回来：
+  `config.py` 的严格 loader **拒绝** yaml 里出现 `future_fuse` / `future_fuse_stages` /
+  `future_fuse_out_proj_init` / `ema_theta` / `attention_stage_of` /
+  `STAGE{1,2}_SEGMENT_VISIBILITY` 这些退役键；契约测试用
+  `RETIRED_BYPASS_PREFIXES = ("future_fuse", "ema_theta", "_ema_theta")` 断言模型上
+  没有这些参数、也没有 `enable_ema` / `update_ema` 方法；
+  `scripts/probe_stage2_eval_path.py` 对 checkpoint payload 做同样的断言。
+  **scorer 也不消费 `predicted_register`**：`scorer.py` 里是 `del predicted_register`，
+  审计字段 `predicted_register_input: False`，且 `config.py` 用
+  `predicted_register_is_input is False` 强制这一点（"strict DrivoR score path cannot
+  consume predicted future registers"）。所以未来既到不了 action token，也到不了 score。
+  旧记录里 `future_fuse` 的 `kdim/vdim`、两个 LayerNorm、`out_proj` 零初始化、
+  `658,944 参数 / 10 tensor`、`EMA_DECAY=0.996` 等全部作废。
+- **Stage 2 的 `loss_future` 与 Stage 1 不可直接比数**，原因见上面 mask 那条：wiring 相同、
+  工作点不同（σ 与 timestep 经 adaLN 调制整个 trunk）。看 Stage 2 的 `loss_future` 曲线时
+  不要把它当成 Stage 1 的延续，回升也不代表 Stage 1 白训了。
 - `scene_tokens = 5 帧 × 16 + 1 ego = 81`，scorer 的默认值同为 81。ego 是 Scene 的
   **最后一个** slot，scorer 用 `scene_context[:, -1:]` 原样取出（不过 LayerNorm）相加。
 - Scorer 的 detach 语义**逐字照抄 DrivoR**：只有 proposals 被 detach，scene K/V **不**
   detach，所以 `loss_score` 会回传塑造 η。对应配置
   `input_detach: [trajectory, predicted_register]`、`scene_kv_detached: false`、
   `updates_scene_lora: true`。**不要"修回去"。**
-- 分辨率：Student 收 DrivoR 官方的 `672×1148`，内部用 4 列**零填充**（归一化之后施加）
-  闭合成 `672×1152` → patch16 grid `42×72`。`_prepare()` **拒绝任何重采样**，连已经
-  填好的 `1152` 也拒（那意味着 loader 自己插值过）。**不要用 timm 的
-  `dynamic_img_pad=True` 绕过 assert**——它会跳过检查但 `patch_embed.grid_size` 仍停在 71，
-  forward 吐 72 列直接 `IndexError`。填充必须在外部做并声明 `img_size=(672,1152)`。
+  注意 `input_detach` 里列了 `predicted_register` 只是沿用 DrivoR 的字段形状，
+  **scorer 并不真的吃它**（见上面 `del predicted_register` 那条）；
+  `predicted_register_is_input` 必须是 `false`。
+- 分辨率：Student 收 DrivoR 官方的 `672×1148`（W,H；`1148 = 14×82`，是 DrivoR 为它的
+  **patch14 DINOv2** 选的），而本包的 DINOv3 是 **patch16**，`1148 % 16 = 12`，
+  所以宽度必须闭合到 16 的倍数。**做法是 bicubic 重采样到 `672×1152`**
+  （`right_resample_px = (-1148) % 16 = 4`，`F.interpolate(mode="bicubic",
+  align_corners=False)`）→ patch16 grid `42×72`、`image_patches = 3024`。
+  **旧版的"4 列零填充（归一化之后施加）"已作废**：零列会伪造 patch 内容——一个横跨
+  真实像素与补零的 patch 编码的是"图像边缘有一块黑"，而那不是场景里存在的东西。
+  严格 loader 因此**拒绝**零填充配置（`right_zero_pad_px != 0` 或
+  `student_resampling` 不是 `bicubic_to_patch_multiple` 都会 `ValueError`，
+  负向测试 `test_strict_config_rejects_zero_padding_instead_of_resampling` 钉住）。
+  `_prepare()` 仍然**拒绝任何自己做的重采样**：输入必须正好是 `672×1148`，
+  连已经填好/插好的 `1152` 也拒（那意味着 loader 自己插值过，重采样必须在模型内部
+  这一处发生）。**不要用 timm 的 `dynamic_img_pad=True` 绕过 assert**——它会跳过检查但
+  `patch_embed.grid_size` 仍停在 71，forward 吐 72 列直接 `IndexError`。
+  构造 backbone 时必须声明 `img_size=(672,1152)`。
 - 位置编码逐字照抄 DrivoR：DINOv3 的 `pos_embed is None`，所以 `_pos_embed` 直接返回原张量
   ——**纯 RoPE，无绝对位置编码，零插值**。`rope_prefix_tokens = 5 + 16 = 21`。
   `_widen_rope_prefix()` **只在 `__init__` 调一次**：在 forward 里临时改
@@ -343,17 +401,31 @@ source_loss 可以安全地按 DrivoR 原值 1.0 训练；rank loss 按 DrivoR �
 
 ## 方案B — Scene 进自注意力 + EMA 教师反向条件化 + per-stage mask（2026-10-15）
 
-这一节经历了两轮用户指令，**后一轮推翻了前一轮关于 mask 的部分**，两轮的其余要求都仍然有效：
+> **本节及下面「训练入口与流水线」「评测」「验证」「已知限制」里的架构描述已被第三轮指令
+> 部分推翻，读到冲突处以「契约要点」为准。** 具体作废清单：
+> ① **两张 per-stage mask 表 → 一张共用表**，`attention_stage` 参数已删除；
+> ② **`future_fuse` + EMA 教师 → 已整体删除**（它就是 `Register → Action` 的显式旁路）；
+> ③ **`Register(8)` / 97 token → `Register(32)` / 121 token**（8 帧 × 每帧 4 个 query）；
+> ④ **4 列零填充 → bicubic 重采样到 `672×1152`**；
+> ⑤ 所有 tensor 数 / 参数量 / 测试项数（`768+108=876`、`84 项`、`93 passed` 之外的）
+>    与 `dit_sequence_tokens=97` 这类实测记录都属于旧 geometry，**不要拿来对账**。
+> 下面保留它们是当作决策史料（为什么 token 顺序是 scene/action/register、为什么 L1 是 loss
+> 而 cosine 只当读数、为什么 Stage 1 只训未来表征），不是当前实现的规格。
+
+这一节经历了三轮用户指令，**后一轮推翻前一轮关于 mask 的部分**，其余要求仍然有效：
 
 - 第一轮：「**不要设置mask啊**，你这里也可以用EMA的机制进行计算，L1loss是一定的。……
   我的核心目标是让模型学会怎么预测未来，**并且把未来条件辅助生成动作**。……
   Action DiT 里的输入 token 顺序是 **scene, action, register** 这个顺序。stage1 就只是
   训个未来表征。」
-- 第二轮（**现行**）：「停，你把 mask 那部分改回去，参照 *Future Register Attention Mask
+- 第二轮：「停，你把 mask 那部分改回去，参照 *Future Register Attention Mask
   Design Review*……这部分得严格按照给你的提示做啊，**不能信息泄漏**。」
+- 第三轮（**现行**）：「**stage1和stage2都用相同的mask机制就行了。一定不要让action看见
+  future。**」——于是两张表合成一张 `((1,0,0),(1,1,0),(1,1,1))`，Action 在**任何** stage
+  都读不到 Register；而为了让"未来条件辅助生成动作"在不打开 `Register → Action` 的前提下
+  仍然成立，`future_fuse` 与 EMA 教师被删除，未来只通过**共享 trunk 的梯度**影响动作。
 
-所以：**token 顺序、EMA、L1、Stage 1 只训未来表征**这四项来自第一轮且保留；
-**"无 mask"这一项作废**，改成第二轮给的两张 per-stage 表（见「契约要点」）。据此做了五件事：
+第一、二轮当时据此做了五件事（其中第 2、5 项已被第三轮撤销）：
 
 1. **序列从 `[Action(8) | Register(8)]` = 16 token 改成 `[Scene(81) | Action(8) |
    Register(8)]` = 97 token**（FastWAM 布局），RoPE 分段从 0 重启，加三个 type embedding。

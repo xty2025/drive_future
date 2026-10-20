@@ -69,6 +69,17 @@ Architecture / supervision
   cache --target-cache-root`` pointing at a ``build_future_target_cache.py``
   output.  Without it ``--lambda-future`` must be 0 and the future branch is
   frozen, so it can never be silently trained toward all-zero placeholders.
+* ``--negative-target-cache-root`` is the future-branch twin of Stage 1's flag of the
+  same name: a second ``build_future_target_cache.py`` output holding the mined
+  ``poor_negative`` future register targets, built over the negative future-video
+  corpus with the SAME ``standardizer.pt``.  Its rows are appended after the positive
+  GT rows in the dataset, so ``gather_flow_data``, the Hungarian match,
+  ``multigt_trajectory_loss`` AND ``dense_future_l1`` all span positives and negatives:
+  each candidate is supervised toward the future of whichever GT (good or bad) it is
+  nearest to, which teaches the model what future a bad trajectory CAUSES rather than
+  only repelling it in the score head.  This is the "negatives as matched GT" front
+  that beats the score-only ``--lambda-neg-score``.  Requires ``--future-target cache``;
+  empty (default) keeps the positives-only trainer bit-identical.
 * ``eta`` + ``theta`` are trained by the trajectory/velocity/future losses, and
   ``theta`` additionally by ``rd_loss`` when negatives are enabled; ``psi``
   (``ScratchDrivoRScorer``) by the DrivoR score loss against the streaming online
@@ -372,6 +383,19 @@ class NavtrainSceneDataset(Dataset):
     DDP), so on failure the next candidate is tried until one loads.
     """
 
+    #: Row-axis tensors a mined-negative payload contributes when merged into its scene,
+    #: identical to Stage 1's ``target_cache.Stage1SceneDataset.NEGATIVE_ROW_KEYS``.  The
+    #: observation side is deliberately absent: a negative row is the same scene at the same
+    #: ``t0``, so the positive payload's history is the only history, and carrying a second
+    #: copy would only create a chance to disagree.
+    NEGATIVE_ROW_KEYS = (
+        "gt_trajectory",
+        "gt_valid",
+        "future_register",
+        "future_chunk_valid",
+        "future_quality",
+    )
+
     def __init__(
         self,
         candidates: list[Candidate],
@@ -383,6 +407,7 @@ class NavtrainSceneDataset(Dataset):
         register_target_dim: int = EXPECTED_REGISTER_TARGET_DIM,
         target_fingerprint: str | None = None,
         negative_root: str | None = None,
+        negative_target_cache_root: str | None = None,
         max_retry: int = 12,
     ) -> None:
         self.candidates = candidates
@@ -394,6 +419,7 @@ class NavtrainSceneDataset(Dataset):
         self.register_target_dim = register_target_dim
         self.target_fingerprint = target_fingerprint
         self.negative_root = negative_root
+        self.negative_target_cache_root = negative_target_cache_root
         self.max_retry = max_retry
 
     def __len__(self) -> int:
@@ -418,7 +444,7 @@ class NavtrainSceneDataset(Dataset):
             observation, targets = sample.observation, sample.targets
             future = self._cached_future(candidate.token, targets.gt_trajectory.shape[0])
             negative = self._load_negative(candidate.token)
-            return {
+            item = {
                 "rgb_history": observation.rgb_history[0],
                 "history_valid": observation.history_valid[0],
                 "ego_history": observation.ego_history[0],
@@ -434,6 +460,23 @@ class NavtrainSceneDataset(Dataset):
                 "neg_score": negative["neg_score"],
                 "scene_id": candidate.token,
             }
+            # Append the mined poor_negative FUTURE rows AFTER the positive GT rows, exactly
+            # as Stage 1's target_cache does, so gather_flow_data / hungarian_xy /
+            # multigt_trajectory_loss / dense_future_l1 all span positives AND negatives:
+            # every candidate is supervised toward the future of whichever GT (good or bad) it
+            # is nearest to, which is what teaches the model what future a bad trajectory
+            # causes.  Positives stay first, so row k of a positives-only batch is still row k
+            # here and a pos-only and a pos+neg run stay diffable row by row.  The count rides
+            # in metadata only -- never in a tensor -- so the model cannot see how many of its
+            # GT rows were mined negatives.
+            negative_rows = self._load_negative_rows(candidate.token)
+            if negative_rows is not None:
+                for key in self.NEGATIVE_ROW_KEYS:
+                    item[key] = torch.cat([item[key], negative_rows[key]], dim=0)
+                item["negative_future_rows"] = int(negative_rows["gt_valid"].shape[0])
+            elif self.negative_target_cache_root is not None:
+                item["negative_future_rows"] = 0
+            return item
         raise RuntimeError(f"could not load any scene near index {index}: {last_error!r}")
 
     def _load_negative(self, scene_id: str) -> dict[str, torch.Tensor]:
@@ -515,6 +558,47 @@ class NavtrainSceneDataset(Dataset):
             "future_quality": payload["future_quality"],
         }
 
+    def _load_negative_rows(self, scene_id: str) -> dict[str, torch.Tensor] | None:
+        """Mined ``poor_negative`` FUTURE rows for this scene, or ``None`` when it has none.
+
+        Symmetric to the positive ``_cached_future``: the negative Stage-0 cache is built by
+        ``build_future_target_cache.py`` over the negative future-video corpus with the SAME
+        ``standardizer.pt`` as the positive cache, so its ``future_register`` lives in the
+        identical target space and its rows can be appended after the positive ones.  This is
+        the Stage-2 twin of ``target_cache.Stage1SceneDataset.load_negative_rows``.
+
+        ``None`` is the normal case, not a failure: a positive scene with no mined negative
+        counterpart must not be dropped.  A *present but mismatched* ``target_fingerprint`` is
+        the error -- concatenating rows standardized into two spaces would supervise one
+        ``future_head`` against a mixture no single scaling describes, and every number would
+        still look finite.
+        """
+        if self.negative_target_cache_root is None:
+            return None
+        path = scene_target_path(self.negative_target_cache_root, scene_id)
+        if not path.exists():
+            return None
+        payload = read_scene_payload(path)
+        if self.target_fingerprint is not None and payload["target_fingerprint"] != self.target_fingerprint:
+            raise ValueError(
+                f"negative scene {scene_id} was extracted with target space {payload['target_fingerprint']}, "
+                f"but the positive cache standardizer is {self.target_fingerprint}; rebuild the negative "
+                f"cache re-using the positive cache's standardizer.pt"
+            )
+        register = payload["future_register"]
+        if register.shape[-1] != self.register_target_dim:
+            raise ValueError(
+                f"negative scene {scene_id}: cached future_register is {register.shape[-1]}-d, "
+                f"the model was built with --register-target-dim {self.register_target_dim}"
+            )
+        return {
+            "gt_trajectory": payload["gt_trajectory"],
+            "gt_valid": payload["gt_valid"],
+            "future_register": register,
+            "future_chunk_valid": payload["future_chunk_valid"],
+            "future_quality": payload["future_quality"],
+        }
+
 
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     size = len(batch)
@@ -544,7 +628,7 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         neg_valid = torch.zeros(size, 0, dtype=torch.bool)
         neg_score = torch.zeros(size, 0)
 
-    return {
+    result = {
         "rgb_history": torch.stack([item["rgb_history"] for item in batch]),
         "history_valid": torch.stack([item["history_valid"] for item in batch]),
         "ego_history": torch.stack([item["ego_history"] for item in batch]),
@@ -560,6 +644,9 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "neg_score": neg_score,
         "scene_ids": [item["scene_id"] for item in batch],
     }
+    if any("negative_future_rows" in item for item in batch):
+        result["negative_future_rows"] = sum(int(item.get("negative_future_rows", 0)) for item in batch)
+    return result
 
 
 def batch_to_device(batch: dict[str, Any], device: torch.device) -> tuple[Observation, dict[str, torch.Tensor], list[str]]:
@@ -705,6 +792,10 @@ def build_generator_and_scorer(
         d_model=target_dim,
         heads=heads,
         ffn_dim=4 * target_dim,
+        # DirectedPairDiT raises unless freq_dim == d_model and defaults freq_dim to
+        # 256, so without this the joint stage cannot be built at any other width --
+        # including the width of a Stage 1 checkpoint it is supposed to restore.
+        freq_dim=target_dim,
         depth=depth,
         register_target_dim=register_target_dim,
         num_scene_tokens=DRIVOR_NUM_SCENE_TOKENS,
@@ -791,7 +882,20 @@ def load_joint_checkpoint(
         grad_checkpointing=grad_checkpointing, device=device,
         predict_future=resolved_future,
     )
-    model.load_state_dict(ckpt["model"], strict=True)
+    # ``trajectory_gates`` was added to NvsActionDiT after the currently-running
+    # (gate-free) checkpoints were saved, so those payloads lack the keys.  The gate
+    # is applied ONLY when ``future is not None`` (see NvsActionDiT.forward); on this
+    # predict_future=False eval/resume path ``future`` is None, so the gates never
+    # touch the forward and tolerating their absence is bit-identical to loading the
+    # pre-gates model.  Guard it: any missing key outside trajectory_gates, or any
+    # unexpected key, is a real mismatch and must still hard-fail.
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    bad_missing = [k for k in missing if not k.startswith("theta.trajectory_gates.")]
+    if bad_missing or unexpected:
+        raise RuntimeError(
+            "checkpoint/model mismatch beyond inert trajectory_gates: "
+            f"missing={bad_missing} unexpected={list(unexpected)}"
+        )
     scorer.load_state_dict(ckpt["scorer"], strict=True)
     model.eval()
     scorer.eval()
@@ -862,6 +966,11 @@ def build_optimizers(
         model.theta.future_queries.requires_grad_(False)
         model.theta.register_type_embedding.requires_grad_(False)
         for parameter in model.theta.future_head.parameters():
+            parameter.requires_grad_(False)
+        # The trajectory gates write only the register slice, so with no future loss and
+        # (in the no-future case) no register segment at all they would be trainable
+        # parameters that produce no gradient -- exactly what DDP's reducer rejects.
+        for parameter in model.theta.trajectory_gates.parameters():
             parameter.requires_grad_(False)
     # 方案A（对齐 DrivoR 感知容量）：Joint 阶段冻结 scene_blocks（8 层 1007-token
     # self-attn）。DrivoR 的 backbone 只训 LoRA、base 冻结，所以敢用 final_score_weight
@@ -992,6 +1101,15 @@ def parse_args() -> argparse.Namespace:
                              "<root>/<token>/gt_trajectories.npy (+ gt_valid_mask.npy, gt_scores.npy), "
                              "e.g. drivezero_goal_gen/outputs/navtrain_poor4_multigt_dense_0p1s_f64_16gpu; "
                              "empty disables the negative preference loss")
+    parser.add_argument("--negative-target-cache-root", default="",
+                        help="a second Stage-0 cache of mined poor_negative FUTURE REGISTER targets, built by "
+                             "build_future_target_cache.py over the negative future-video corpus with the SAME "
+                             "standardizer.pt as --target-cache-root. Its rows are appended after the positive "
+                             "GT rows, so the action matching AND dense_future_l1 both span positives and "
+                             "negatives: each candidate is supervised toward the future of whichever GT (good or "
+                             "bad) it is nearest to, teaching the model what future a bad trajectory causes -- the "
+                             "future-branch twin of Stage 1's --negative-target-cache-root. Requires "
+                             "--future-target cache. Empty (default) keeps the positives-only trainer bit-identical.")
     parser.add_argument("--lambda-neg", type=float, default=0.0,
                         help="weight of DrivoR's rd_loss: repels the oracle-chosen generator "
                              "proposal from each mined poor_negative in trajectory space, so the "
@@ -1169,6 +1287,39 @@ def main() -> int:
     # trajectory/GT-matching front is untouched.  Gated here so the forward's second
     # scorer pass and the loss term only exist when this run actually asks for them.
     neg_score_enabled = neg_enabled and args.lambda_neg_score > 0.0
+    # ---- mined-negative FUTURE cache (the future-branch twin of Stage 1) ---------- #
+    # Symmetric to the positive --target-cache-root: a second Stage-0 cache holding the
+    # poor_negative future register targets, built over the negative future-video corpus
+    # with the SAME standardizer.pt.  Its rows are appended after the positive GT rows in
+    # the dataset, so gather_flow_data / hungarian_xy / multigt_trajectory_loss AND
+    # dense_future_l1 all span positives and negatives -- the model predicts each bad
+    # trajectory's OWN future instead of only being repelled by it in the score head.
+    # Disabled unless a root is given; when disabled the trainer is bit-identical.
+    args.negative_target_cache_root = args.negative_target_cache_root.strip()
+    negative_future_enabled = bool(args.negative_target_cache_root)
+    if negative_future_enabled:
+        if args.future_target != "cache":
+            raise ValueError(
+                "--negative-target-cache-root needs --future-target cache: negatives supply future "
+                "register rows, which only exist when the positive future branch is on"
+            )
+        if not standardizer_path(args.negative_target_cache_root).exists():
+            raise ValueError(
+                f"{standardizer_path(args.negative_target_cache_root)} is missing; build the negative "
+                f"cache with build_future_target_cache.py re-using the positive cache's standardizer.pt"
+            )
+        # Checked once here rather than per scene: __getitem__ retries the next token on any
+        # exception, so a target-space mismatch found per scene would be swallowed into
+        # "could not load any scene near index" instead of naming the actual problem -- two
+        # caches standardized into different spaces.
+        negative_standardizer, _ = load_standardizer(args.negative_target_cache_root)
+        if cache_standardizer is not None and negative_standardizer.fingerprint() != cache_standardizer.fingerprint():
+            raise ValueError(
+                f"negative cache {args.negative_target_cache_root} is standardized as "
+                f"{negative_standardizer.fingerprint()} but the positive cache is "
+                f"{cache_standardizer.fingerprint()}; rebuild the negative cache re-using the "
+                f"positive cache's standardizer.pt so both live in one target space"
+            )
     # Whether the future tokens sit in the sequence is a *different* question from
     # whether they train.  Restoring a Stage 1 checkpoint means the trunk was shaped
     # around 16 tokens and the future branch carries Stage 1's whole product, which
@@ -1254,6 +1405,7 @@ def main() -> int:
         register_target_dim=register_target_dim,
         target_fingerprint=cache_standardizer.fingerprint() if cache_standardizer is not None else None,
         negative_root=args.negative_root or None,
+        negative_target_cache_root=args.negative_target_cache_root or None,
     )
     sampler = DistributedSampler(dataset, num_replicas=dctx.world, rank=dctx.rank, shuffle=True, drop_last=True) if dctx.enabled else None
     loader = DataLoader(
@@ -1382,6 +1534,7 @@ def main() -> int:
             "lambda_neg_match": args.lambda_neg_match if neg_enabled else 0.0,
             "lambda_neg_score": args.lambda_neg_score if neg_enabled else 0.0,
             "negative_root": args.negative_root or None,
+            "negative_target_cache_root": args.negative_target_cache_root or None,
             "dense_weight": args.dense_weight,
             "diversity_weight": args.diversity_weight,
             "dense_gate_m": args.dense_gate_m,
@@ -1663,6 +1816,7 @@ def main() -> int:
                 metrics = all_reduce_sum(metrics, dctx)
                 neg_per_scene = None
                 neg_scene_frac = None
+                neg_future_rows = None
                 if neg_enabled:
                     # Coverage of the mined corpus inside the current global batch:
                     # ~25% of navtrain scenes legitimately carry zero negatives, so
@@ -1678,6 +1832,15 @@ def main() -> int:
                     denom_neg = float(size * dctx.world)
                     neg_per_scene = round(float(neg_cov[0]) / denom_neg, 3)
                     neg_scene_frac = round(float(neg_cov[1]) / denom_neg, 4)
+                if negative_future_enabled:
+                    # How many poor_negative FUTURE rows were appended to the positive GT rows
+                    # across the global batch this step.  A silent zero means the negative future
+                    # cache stopped matching these tokens, so gather_flow_data / the Hungarian
+                    # match / dense_future_l1 are quietly positives-only again.  Reduced on every
+                    # rank exactly like the coverage above.
+                    neg_future_cov = torch.tensor([float(batch.get("negative_future_rows", 0))], device=device)
+                    neg_future_cov = all_reduce_sum(neg_future_cov, dctx)
+                    neg_future_rows = int(neg_future_cov.item())
                 denom_scene = max(float(metrics[5].item()), 1.0)
                 denom_ade = max(float(metrics[4].item()), 1.0)
                 denom_near = max(float(metrics[7].item()), 1.0)
@@ -1710,6 +1873,8 @@ def main() -> int:
                     "oracle_failures": oracle_failures,
                     "sec_per_step": round((time.time() - run_start) / opt_step, 3),
                 }
+                if negative_future_enabled:
+                    record["negative_future_rows"] = neg_future_rows
                 if phase_timing and phase_iters:
                     record.update({f"phase_{k}_ms": round(phase_acc[k] / phase_iters * 1000.0, 1)
                                    for k in phase_acc})

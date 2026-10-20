@@ -152,7 +152,7 @@ def main() -> int:
     modes = trainer.ImmutableModeBuffer().subset(64).to(device)
     initializer = trainer.StructuredSourceInitializer(jitter_std=0.0)
 
-    acc = torch.zeros(6)
+    acc = torch.zeros(8)
     per_scene: list[dict] = []
     oracle_failures = 0
     ns_mean_sum = 0.0

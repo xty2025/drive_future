@@ -123,6 +123,13 @@ STAGE1_PRECISION="${NVS_STAGE1_PRECISION:-bf16}"
 # NVS_STAGE1_LR to try it.
 STAGE1_LR="${NVS_STAGE1_LR:-2e-4}"
 STAGE1_WARMUP="${NVS_STAGE1_WARMUP:-500}"
+# Weight of the background-free paired contrast term.  Measured on 400 cached scenes the
+# scene mean of the register target carries 59.8% of the L1 objective, and on the rendered
+# future pixels 79.5% of the variance is fixed by the scene before any trajectory is read
+# (rising from 91.5% background at +0.5s to ~75% at +4.0s), so the plain identity L1 spends
+# most of its gradient on a quantity the trajectory cannot change.  The contrast term
+# cancels the scene mean exactly.  Set NVS_STAGE1_LAMBDA_CONTRAST=0 for the plain objective.
+STAGE1_LAMBDA_CONTRAST="${NVS_STAGE1_LAMBDA_CONTRAST:-1.0}"
 # 20 steps is ~20 log lines per epoch, ~400 over the run: enough for a loss/cosine
 # curve, and each one costs a single 3-value all-reduce.
 STAGE1_LOG_EVERY="${NVS_STAGE1_LOG_EVERY:-20}"
@@ -416,6 +423,7 @@ if [ -z "${NVS_SKIP_STAGE1:-}" ]; then
     --max-steps "$STAGE1_STEPS" \
     --lr "$STAGE1_LR" \
     --warmup "$STAGE1_WARMUP" \
+    --lambda-contrast "$STAGE1_LAMBDA_CONTRAST" \
     --clip-grad-norm 1.0 \
     --train-metric-scenes "$STAGE1_TRAIN_METRIC_SCENES" \
     --eval-metric-scenes "$STAGE1_EVAL_METRIC_SCENES" \
