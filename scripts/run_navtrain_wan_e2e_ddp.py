@@ -705,6 +705,10 @@ def build_generator_and_scorer(
         d_model=target_dim,
         heads=heads,
         ffn_dim=4 * target_dim,
+        # DirectedPairDiT raises unless freq_dim == d_model and defaults freq_dim to
+        # 256, so without this the joint stage cannot be built at any other width --
+        # including the width of a Stage 1 checkpoint it is supposed to restore.
+        freq_dim=target_dim,
         depth=depth,
         register_target_dim=register_target_dim,
         num_scene_tokens=DRIVOR_NUM_SCENE_TOKENS,
@@ -791,7 +795,20 @@ def load_joint_checkpoint(
         grad_checkpointing=grad_checkpointing, device=device,
         predict_future=resolved_future,
     )
-    model.load_state_dict(ckpt["model"], strict=True)
+    # ``trajectory_gates`` was added to NvsActionDiT after the currently-running
+    # (gate-free) checkpoints were saved, so those payloads lack the keys.  The gate
+    # is applied ONLY when ``future is not None`` (see NvsActionDiT.forward); on this
+    # predict_future=False eval/resume path ``future`` is None, so the gates never
+    # touch the forward and tolerating their absence is bit-identical to loading the
+    # pre-gates model.  Guard it: any missing key outside trajectory_gates, or any
+    # unexpected key, is a real mismatch and must still hard-fail.
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    bad_missing = [k for k in missing if not k.startswith("theta.trajectory_gates.")]
+    if bad_missing or unexpected:
+        raise RuntimeError(
+            "checkpoint/model mismatch beyond inert trajectory_gates: "
+            f"missing={bad_missing} unexpected={list(unexpected)}"
+        )
     scorer.load_state_dict(ckpt["scorer"], strict=True)
     model.eval()
     scorer.eval()
@@ -862,6 +879,11 @@ def build_optimizers(
         model.theta.future_queries.requires_grad_(False)
         model.theta.register_type_embedding.requires_grad_(False)
         for parameter in model.theta.future_head.parameters():
+            parameter.requires_grad_(False)
+        # The trajectory gates write only the register slice, so with no future loss and
+        # (in the no-future case) no register segment at all they would be trainable
+        # parameters that produce no gradient -- exactly what DDP's reducer rejects.
+        for parameter in model.theta.trajectory_gates.parameters():
             parameter.requires_grad_(False)
     # 方案A（对齐 DrivoR 感知容量）：Joint 阶段冻结 scene_blocks（8 层 1007-token
     # self-attn）。DrivoR 的 backbone 只训 LoRA、base 冻结，所以敢用 final_score_weight

@@ -398,10 +398,19 @@ class DirectedPairDiT(nn.Module):
         ``predict_future`` is off.
 
         The register reads the action segment beside it and the action cannot read
-        back, so ``(Scene, Action) -> Future`` holds identically in Stage 1 and in
-        Stage 2 and ``loss_future`` measures the same function in both.  The future
-        therefore never conditions the velocity: it is an auxiliary head whose
-        gradient shapes the block stack the action stream shares and nothing more.
+        back, so ``(Scene, Action) -> Future`` is one wiring for Stage 1, Stage 2 and
+        the deployed path alike.  Same wiring is not same operating point: Stage 1
+        runs ``timestep = 0`` on the clean GT trajectory while Stage 2 runs a sampled
+        ``sigma`` on the noised one, and ``timestep`` reaches the register through the
+        adaLN modulation of every block -- measured on the production geometry, a
+        condition perturbation of its own magnitude moves the register output by 44%
+        of ``|register|``.  So the two stages' ``loss_future`` come from the same
+        function evaluated at different inputs and their absolute values are not
+        directly comparable; a Stage-2 rise is not evidence Stage 1 was wasted.
+
+        The future therefore never conditions the velocity: it is an auxiliary head
+        whose gradient shapes the block stack the action stream shares and nothing
+        more.
 
         The returned ``scene`` is eta's refined Scene, untouched by the DiT: Scene
         reads only itself.  That is what keeps the scorer's K/V exactly DrivoR's.

@@ -478,6 +478,18 @@ class Stage1SceneDataset(Dataset):
     matching ``NavtrainSceneDataset`` in ``run_navtrain_wan_e2e_ddp.py``.
     """
 
+    #: Row-axis tensors a mined-negative payload contributes when it is merged into
+    #: its scene.  The observation side is deliberately absent: a negative row is the
+    #: same scene at the same ``t0``, so the positive payload's history is the only
+    #: history, and carrying a second copy would only create a chance to disagree.
+    NEGATIVE_ROW_KEYS = (
+        "gt_trajectory",
+        "gt_valid",
+        "future_register",
+        "future_chunk_valid",
+        "future_quality",
+    )
+
     def __init__(
         self,
         scene_ids: Sequence[str],
@@ -487,6 +499,7 @@ class Stage1SceneDataset(Dataset):
         target_fingerprint: str | None = None,
         max_retry: int = 12,
         min_gt_spread_m: float = MIN_GT_SPREAD_M,
+        negative_target_cache_root: str | Path | None = None,
     ) -> None:
         self.scene_ids = [str(token) for token in scene_ids]
         if not self.scene_ids:
@@ -497,6 +510,22 @@ class Stage1SceneDataset(Dataset):
         self.target_fingerprint = target_fingerprint
         self.max_retry = int(max_retry)
         self.min_gt_spread_m = float(min_gt_spread_m)
+        self.negative_target_cache_root = (
+            None if negative_target_cache_root is None else Path(negative_target_cache_root)
+        )
+        if self.negative_target_cache_root is not None:
+            # Checked once here rather than per scene: ``__getitem__`` retries the next
+            # token on any exception, so a target-space mismatch found per scene would
+            # be swallowed into "could not load any scene near index" instead of naming
+            # the actual problem -- two caches standardized into different spaces.
+            negative_standardizer, _ = load_standardizer(self.negative_target_cache_root)
+            negative_fingerprint = negative_standardizer.fingerprint()
+            if target_fingerprint is not None and negative_fingerprint != target_fingerprint:
+                raise ValueError(
+                    f"negative cache {self.negative_target_cache_root} is standardized as "
+                    f"{negative_fingerprint} but the positive cache is {target_fingerprint}; "
+                    f"rebuild the negative cache re-using the positive cache's standardizer.pt"
+                )
 
     def __len__(self) -> int:
         return len(self.scene_ids)
@@ -528,6 +557,46 @@ class Stage1SceneDataset(Dataset):
             )
         return payload
 
+    def load_negative_rows(self, scene_id: str) -> dict[str, Any] | None:
+        """Mined ``poor_negative`` rows for this scene, or ``None`` when it has none.
+
+        ``None`` is the normal case, not a failure: 26,006 of the 103,075 navtrain
+        scenes were mined to zero negatives and the published negative video corpus
+        covers 77,067 scenes, so a positive token with no negative counterpart is
+        expected and must not drop the scene -- dropping it would silently train on a
+        different corpus than the positive-only run this one is compared against.
+
+        A *present but mismatched* payload is the error.  ``target_fingerprint``
+        hashes the standardizer's fitted mean/scale, so a difference means the two
+        caches were standardized into different target spaces; concatenating their
+        rows would supervise one head against a mixture no single scaling describes,
+        and the numbers would still look finite.  The negative cache is built by
+        re-using the positive cache's ``standardizer.pt`` rather than fitting its own
+        precisely so this cannot happen by accident.
+
+        ``skip_degenerate`` is *not* applied here.  On the positive side it protects
+        the Multi-GT contrast from scenes whose four labels collapse onto one
+        trajectory; a negative set with little internal spread still adds the
+        positive-versus-negative contrast, which is the point of merging it.
+        """
+
+        if self.negative_target_cache_root is None:
+            return None
+        path = scene_target_path(self.negative_target_cache_root, scene_id)
+        if not path.exists():
+            return None
+        payload = read_scene_payload(path)
+        if self.target_fingerprint is not None and payload["target_fingerprint"] != self.target_fingerprint:
+            raise ValueError(
+                f"negative scene {scene_id} was extracted with target space {payload['target_fingerprint']}, "
+                f"but the cache standardizer is {self.target_fingerprint}"
+            )
+        if [int(value) for value in payload["image_hw"]] != [self.image_hw[0], self.image_hw[1]]:
+            raise ValueError(
+                f"negative scene {scene_id} was cached at {payload['image_hw']}, loader wants {list(self.image_hw)}"
+            )
+        return payload
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         total = len(self.scene_ids)
         last_error: Exception | None = None
@@ -539,7 +608,7 @@ class Stage1SceneDataset(Dataset):
             except Exception as error:  # one unreadable scene must not stall DDP
                 last_error = error
                 continue
-            return {
+            item = {
                 "scene_id": scene_id,
                 "rgb_history": rgb_history,
                 "history_valid": payload["history_valid"],
@@ -553,7 +622,20 @@ class Stage1SceneDataset(Dataset):
                 "future_quality": payload["future_quality"],
                 "labels": list(payload["labels"]),
                 "degenerate_multi_gt": bool(payload["degenerate_multi_gt"]),
+                "negative_rows": 0,
             }
+            negative = self.load_negative_rows(scene_id)
+            if negative is not None:
+                # Positives stay first, so row k of the positive-only batch is still
+                # row k here -- negatives are appended, never interleaved.  Nothing
+                # downstream may key off that order (the mode code is zeroed exactly
+                # so a row cannot be identified by its position), but keeping it
+                # stable makes a pos-only and a pos+neg run diffable row by row.
+                for key in self.NEGATIVE_ROW_KEYS:
+                    item[key] = torch.cat([item[key], negative[key]], dim=0)
+                item["labels"] = [*item["labels"], *[f"neg:{label}" for label in negative["labels"]]]
+                item["negative_rows"] = int(negative["gt_valid"].shape[0])
+            return item
         raise RuntimeError(f"could not load any scene near index {index}: {last_error!r}")
 
 
@@ -577,7 +659,16 @@ def collate_stage1_batch(batch: list[dict[str, Any]]) -> tuple[Observation, Pair
         ego_history=torch.stack([item["ego_history"] for item in batch]),
         route_command=torch.stack([item["route_command"] for item in batch]),
         relative_ego_poses=torch.stack([item["relative_ego_poses"] for item in batch]),
-        camera_metadata=[{"scene_id": item["scene_id"], "labels": item["labels"]} for item in batch],
+        camera_metadata=[
+            {
+                "scene_id": item["scene_id"],
+                "labels": item["labels"],
+                # Logging only: it rides in metadata, never in a tensor, so the model
+                # cannot see how many of its rows were mined negatives.
+                "negative_rows": int(item.get("negative_rows", 0)),
+            }
+            for item in batch
+        ],
     )
     targets = PairTargets(
         gt_trajectory=pad("gt_trajectory", 0.0),

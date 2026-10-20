@@ -15,7 +15,11 @@ from dataclasses import dataclass
 import torch
 
 from .data import Observation, PairTargets
-from .losses import assert_disjoint_parameter_groups, identity_future_l1
+from .losses import (
+    assert_disjoint_parameter_groups,
+    identity_future_l1,
+    paired_contrast_future_l1,
+)
 from .model import DirectedPairDiT, parameter_groups
 from .vision import freeze_backbone_keep_lora
 from .scorer import ScratchDrivoRScorer
@@ -25,6 +29,7 @@ from .scorer import ScratchDrivoRScorer
 class Stage1Result:
     loss_future: torch.Tensor
     supervised_rows: int
+    loss_contrast: torch.Tensor | None = None
 
 
 def _set_generator_trainability(model: DirectedPairDiT, stage: int) -> None:
@@ -101,6 +106,7 @@ def stage1_step(
     targets: PairTargets,
     model: DirectedPairDiT,
     optimizer: torch.optim.Optimizer,
+    lambda_contrast: float = 0.0,
 ) -> Stage1Result:
     """Trajectory-conditioned future representation training.
 
@@ -111,14 +117,23 @@ def stage1_step(
     index would let the network identify the GT from its row alone and skip the
     trajectory.
 
+    ``lambda_contrast`` adds the background-free paired term of
+    :func:`~nvs_v6_wan_e2e.losses.paired_contrast_future_l1`.  The scene mean carries
+    ~60% of the L1 objective and ~79.5% of the rendered future's pixel variance, so
+    ``identity_future_l1`` on its own spends most of its gradient on a quantity the
+    trajectory cannot change; the contrast term is the part that only the trajectory
+    explains.  Zero keeps the plain objective for callers that have not opted in.
+
     The input is noise-free by construction: ``forward_register_only`` runs the
     clean trajectory, which is the ``sigma = 0`` end of the same flow Stage 2
     noises.  Everything except the velocity head learns here -- which is exactly
     "train the future representation": no action-generation objective is optimized
     in this stage.  The single segment mask applies, so the register reads the
     clean action while the action cannot read the register back; that is the same
-    information flow Stage 2 and the deployed path run, which is what makes
-    ``loss_future`` comparable across stages.
+    information flow Stage 2 and the deployed path run.  The flow is shared but the
+    operating point is not -- Stage 2 noises the action and samples a timestep, and
+    the timestep modulates every block through adaLN -- so ``loss_future`` is not
+    numerically comparable between the two stages even though the wiring is.
     """
 
     model.train()
@@ -128,7 +143,12 @@ def stage1_step(
     modes = torch.zeros((*source.shape[:2], 2), device=source.device, dtype=source.dtype)
     predicted_register = model.forward_register_only(observation, source, modes)
     loss_future = identity_future_l1(predicted_register, targets)
-    loss_future.backward()
+    loss_contrast: torch.Tensor | None = None
+    loss = loss_future
+    if lambda_contrast > 0:
+        loss_contrast = paired_contrast_future_l1(predicted_register, targets)
+        loss = loss + lambda_contrast * loss_contrast
+    loss.backward()
     optimizer.step()
     supervised_rows = int(targets.gt_valid.sum())
-    return Stage1Result(loss_future.detach(), supervised_rows)
+    return Stage1Result(loss_future.detach(), supervised_rows, None if loss_contrast is None else loss_contrast.detach())

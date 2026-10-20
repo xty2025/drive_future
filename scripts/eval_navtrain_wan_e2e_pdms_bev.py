@@ -59,10 +59,11 @@ if str(SCRIPTS_DIR) not in sys.path:
 import run_navtrain_wan_e2e_ddp as trainer  # noqa: E402
 from nvs_v6_wan_e2e.data import (  # noqa: E402
     Observation,
+    REGISTER_TOKENS,
     drivor_observable_ego_feature,
     drivor_route_command,
 )
-from nvs_v6_wan_e2e.real_data import _frame_image, _relative_pose  # noqa: E402
+from nvs_v6_wan_e2e.real_data import _frame_image, _relative_pose, DRIVOR_OFFICIAL_IMAGE_HW  # noqa: E402
 
 
 def encode_trajectory(trajectory, xy_scale: float = 20.0):
@@ -173,7 +174,8 @@ def draw_bev_eval(
 # intersected with the trainval log frame index (no multigt intersection).
 # --------------------------------------------------------------------------- #
 def load_navtest_sample(log_path: Path, sensor_root: str, frame_index: int,
-                        camera: str = "CAM_F0", image_size: int = 224) -> dict:
+                        camera: str = "CAM_F0", image_hw: tuple[int, int] = DRIVOR_OFFICIAL_IMAGE_HW,
+                        register_target_dim: int = 256) -> dict:
     """Mirror ``load_real_navsim_sample``'s Observation exactly, GT from the log."""
     with log_path.open("rb") as handle:
         frames = pickle.load(handle)
@@ -185,7 +187,7 @@ def load_navtest_sample(log_path: Path, sensor_root: str, frame_index: int,
     future_indices = list(range(frame_index + 1, frame_index + 9))
     reference = np.asarray(frame["ego2global"], dtype=np.float64)
 
-    rgb = torch.stack([_frame_image(frames[i], Path(sensor_root), camera, image_size) for i in context_indices])
+    rgb = torch.stack([_frame_image(frames[i], Path(sensor_root), camera, image_hw) for i in context_indices])
     relative_poses = torch.from_numpy(
         np.stack([_relative_pose(reference, np.asarray(frames[i]["ego2global"], dtype=np.float64)) for i in context_indices])
     )
@@ -209,6 +211,12 @@ def load_navtest_sample(log_path: Path, sensor_root: str, frame_index: int,
         "gt_trajectory": trajectories,                    # [1,8,3]
         "gt_encoded": encode_trajectory(trajectories),    # [1,8,4]
         "gt_valid": torch.ones(1, dtype=torch.bool),
+        # predict_future is off for this lineage, so trainer.collate only needs the
+        # key present to pad; inference never reads it.  Shape mirrors training's
+        # no-target-cache branch ([K, REGISTER_TOKENS, dim]) so pad_rows is consistent.
+        "future_register": torch.zeros(trajectories.shape[0], REGISTER_TOKENS, register_target_dim),
+        "future_chunk_valid": torch.zeros(trajectories.shape[0], REGISTER_TOKENS, dtype=torch.bool),
+        "future_quality": torch.zeros(trajectories.shape[0], REGISTER_TOKENS),
         "scene_id": frame_token,
     }
 

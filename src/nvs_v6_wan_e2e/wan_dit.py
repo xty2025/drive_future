@@ -256,6 +256,81 @@ class CrossAttention(nn.Module):
         return self.o(out.transpose(1, 2).reshape(batch, length, self.attn_hidden_dim))
 
 
+class TrajectoryGate(nn.Module):
+    """One-way cross-attention giving the register a guaranteed route to the action segment.
+
+    Measured on the production geometry with the real DINOv3 scene stream, register rows
+    put only **8-10%** of their self-attention mass on the eight action keys (Scene takes
+    61-66% with 81 keys, the register's own segment 24-31%), while the register's *input*
+    is trajectory-independent by construction (``future_queries`` + ego).  The trajectory
+    therefore reaches the future readout only through a ~9%-per-hop channel that compounds
+    across eight blocks into the ~583x attenuation seen in
+    ``trajectory_conditioning_fidelity``.  Softmax competition with 81 scene keys is the
+    mechanism, and no reweighting of the objective can remove it: a contrast term that
+    supervises the across-GT difference *exactly* still left ``residual_relative_l1``
+    pinned at 1.0 after 50 overfitting steps.
+
+    The gate is one-way -- register queries, action keys/values -- so it cannot reopen the
+    forbidden ``Action <- Register`` direction in reverse: action tokens read neither the
+    register here nor anywhere else, and :data:`NvsActionDiT.SEGMENT_VISIBILITY` is
+    untouched.  ``out`` is zero-initialised, so step 0 is bitwise identical to the ungated
+    stack: the gate can only add trajectory signal, never displace a pretrained one.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        attn_head_dim: int,
+        num_heads: int,
+        action_tokens: int,
+        queries_per_frame: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.attn_head_dim = attn_head_dim
+        self.attn_hidden_dim = num_heads * attn_head_dim
+        self.q = nn.Linear(hidden_dim, self.attn_hidden_dim)
+        self.k = nn.Linear(hidden_dim, self.attn_hidden_dim)
+        self.v = nn.Linear(hidden_dim, self.attn_hidden_dim)
+        self.o = nn.Linear(self.attn_hidden_dim, hidden_dim)
+        self.norm_q = RMSNorm(self.attn_hidden_dim, eps=eps)
+        self.norm_k = RMSNorm(self.attn_hidden_dim, eps=eps)
+        # Frame-aligned read: register row ``q + Q*f`` attends to action token ``f`` and
+        # nothing else.  Without this the gate's softmax spreads over all eight action
+        # rows, so every register row reads the *mean* trajectory and the rows stay
+        # bitwise identical -- measured as ``residual_relative_l1`` pinned at 1.0 even
+        # with the gate live.  The alignment is the one the RoPE phases already intend
+        # (register token ``q + Q*f`` is the future of the instant action token ``f``
+        # predicts); the mask makes it exact instead of merely suggested.
+        rows = queries_per_frame * action_tokens
+        mask = torch.zeros(rows, action_tokens, dtype=torch.bool)
+        for frame in range(action_tokens):
+            for query in range(queries_per_frame):
+                mask[query + queries_per_frame * frame, frame] = True
+        self.register_buffer("frame_mask", mask, persistent=False)
+        # ``o`` keeps nn.Linear's default init.  Two rejected alternatives, both measured:
+        # zero-init left ``residual_relative_l1`` pinned at 1.0 through the whole warmup
+        # (``o`` only reaches ~4e-3 in 20 AdamW steps at lr 2e-4), and std 1e-2 -- 6x below
+        # the default 1/sqrt(256) -- still left the gate ~100x too weak to move the
+        # across-GT row spread at init, and 80 probe steps cannot grow it the remaining
+        # distance.  There is no pretrained register stream to protect, so a
+        # default-strength route from step 0 is the honest choice; the bias stays zero.
+        nn.init.zeros_(self.o.bias)
+
+    def _split(self, x: torch.Tensor) -> torch.Tensor:
+        batch, length, _ = x.shape
+        return x.view(batch, length, self.num_heads, self.attn_head_dim).transpose(1, 2)
+
+    def forward(self, register: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        q = self._split(self.norm_q(self.q(register)))
+        k = self._split(self.norm_k(self.k(action)))
+        v = self._split(self.v(action))
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=self.frame_mask)
+        batch, length = register.shape[0], register.shape[1]
+        return self.o(out.transpose(1, 2).reshape(batch, length, self.attn_hidden_dim))
+
+
 class DiTBlock(nn.Module):
     def __init__(self, hidden_dim: int, attn_head_dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -344,6 +419,7 @@ class NvsActionDiT(nn.Module):
         "time_queries",
         "future_queries",
         "future_head.",
+        "trajectory_gates.",
         "scene_type_embedding",
         "action_type_embedding",
         "register_type_embedding",
@@ -440,6 +516,16 @@ class NvsActionDiT(nn.Module):
         self.text_embedding = nn.Sequential(nn.Linear(text_dim, hidden_dim), nn.GELU(approximate="tanh"), nn.Linear(hidden_dim, hidden_dim))
         self.blocks = nn.ModuleList(
             [DiTBlock(hidden_dim, attn_head_dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
+        )
+        #: One guaranteed trajectory route per block; see :class:`TrajectoryGate`.  Only
+        #: applied when the register segment is present, and frozen (so DDP's reducer
+        #: ignores it) when ``predict_future`` is off and there is no register to gate.
+        self.trajectory_gates = nn.ModuleList(
+            [
+                TrajectoryGate(hidden_dim, attn_head_dim, num_heads, action_tokens,
+                               future_tokens // action_tokens, eps)
+                for _ in range(num_layers)
+            ]
         )
         self.head = Head(hidden_dim, action_dim, eps)
         self.time_queries = nn.Parameter(torch.randn(action_tokens, hidden_dim) * 0.02)
@@ -719,8 +805,18 @@ class NvsActionDiT(nn.Module):
         freqs = self.rope_for_segments(lengths, tokens.device)
         mask = self.segment_attention_mask(lengths, tokens.device)
         x = tokens
-        for block in self.blocks:
+        action_start = scene_tokens
+        register_start = scene_tokens + self.action_tokens
+        for block, gate in zip(self.blocks, self.trajectory_gates):
             x = block(x, embedded, t_mod, freqs, self_attn_mask=mask)
+            if future is not None:
+                # The gate writes only the register slice: scene and action tokens pass
+                # through untouched, so the scorer's K/V and the flow velocity see exactly
+                # the sequence the ungated stack produced, plus a register that finally
+                # hears the trajectory at full volume instead of ~9% per hop.
+                register = x[:, register_start:]
+                action = x[:, action_start:register_start]
+                x = torch.cat([x[:, :register_start], register + gate(register, action)], dim=1)
         readout = x[:, scene_tokens:]
         velocity = self.head(readout[:, : self.action_tokens], condition)
         if future is None:

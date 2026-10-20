@@ -58,7 +58,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from nvs_v6_wan_e2e.data import Observation, PairTargets, REGISTER_TOKENS
-from nvs_v6_wan_e2e.losses import identity_future_l1
+from nvs_v6_wan_e2e.losses import identity_future_l1, paired_contrast_future_l1
 from nvs_v6_wan_e2e.model import DirectedPairDiT, parameter_groups
 from nvs_v6_wan_e2e.modes import ImmutableModeBuffer, StructuredSourceInitializer
 from nvs_v6_wan_e2e.scorer import ScratchDrivoRScorer
@@ -80,6 +80,7 @@ from nvs_v6_wan_e2e.target_cache import (
     manifest_path,
     observation_to_device,
     ready_scenes_path,
+    scene_target_path,
     split_scene_tokens,
     standardizer_path,
     targets_to_device,
@@ -327,6 +328,18 @@ def save_checkpoint(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--target-cache-root", required=True, help="the Stage-0 cache: standardizer.pt, targets/ and _manifest.json")
+    parser.add_argument(
+        "--negative-target-cache-root",
+        default=None,
+        help=(
+            "a second Stage-0 cache of mined poor_negative rows, built over the negative "
+            "future-video corpus with the SAME standardizer.pt as --target-cache-root. A scene's "
+            "negative rows are appended after its positive ones, which widens the trajectory "
+            "spread the register has to explain far beyond the near-identical Multi-GT positives. "
+            "Training rows only: the verdict pass stays positive-only so its numbers remain "
+            "comparable with a run that has no negatives. Default off."
+        ),
+    )
     parser.add_argument("--output-dir", default="artifacts/stage1_cache_ddp")
     # ---- model: every one of these must equal Stage 2's, or its strict load fails ---- #
     parser.add_argument("--dino-checkpoint", default=DEFAULT_DINO_CHECKPOINT)
@@ -360,6 +373,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=0, help="stop after this many optimizer steps; 0 runs every epoch")
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument(
+        "--lambda-contrast",
+        type=float,
+        default=1.0,
+        help=(
+            "weight of the background-free paired contrast term. The scene mean of the "
+            "register target carries ~60%% of the L1 objective and ~79.5%% of the rendered "
+            "future's pixel variance, so the plain identity L1 spends most of its gradient "
+            "on a quantity the trajectory cannot change; the contrast term cancels the scene "
+            "mean exactly. 0 disables it and reproduces the plain objective."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=500)
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
     parser.add_argument("--find-unused", action="store_true", help="DDP find_unused_parameters=True (safer, slower)")
@@ -525,6 +550,22 @@ def main() -> int:
         usable_train, args.target_cache_root, image_hw=image_hw,
         skip_degenerate=args.skip_degenerate, target_fingerprint=fingerprint,
         min_gt_spread_m=args.min_gt_spread_m,
+        negative_target_cache_root=args.negative_target_cache_root,
+    )
+    # The verdict pass and the mean-target baseline read a positive-only dataset even
+    # when training merges negatives.  Both are defined against the rows they are
+    # given: the scene-mean anchor averages them, so eight rows spanning a much wider
+    # trajectory range would move the anchor and every gain_over_* ratio with it, and
+    # this run would stop being comparable with the positive-only run it exists to be
+    # compared against.
+    metric_train_dataset = (
+        Stage1SceneDataset(
+            usable_train, args.target_cache_root, image_hw=image_hw,
+            skip_degenerate=args.skip_degenerate, target_fingerprint=fingerprint,
+            min_gt_spread_m=args.min_gt_spread_m,
+        )
+        if args.negative_target_cache_root
+        else train_dataset
     )
     # Only built when there is something held out.  A dataset that fell back to
     # training scenes would satisfy the constructor and then report train scenes as
@@ -539,7 +580,24 @@ def main() -> int:
         if usable_eval
         else None
     )
-    mean_target, mean_target_scenes = mean_target_from_cache(dctx, train_dataset, usable_train, args.mean_target_scenes)
+    if args.negative_target_cache_root:
+        # An existence probe, not a payload read: it answers "is the negative cache
+        # really keyed by these tokens" before 16 ranks spend an epoch discovering it
+        # was built over a different corpus.  Actual row counts arrive per step as
+        # ``negative_gt_rows``.
+        probe = list(usable_train[:256])
+        negative_root = Path(args.negative_target_cache_root)
+        hits = sum(1 for token in probe if scene_target_path(negative_root, token).exists())
+        log0(dctx, {"event": "negative_cache", "root": str(negative_root),
+                    "probed_train_scenes": len(probe), "with_negatives": hits,
+                    "hit_rate": round(hits / max(1, len(probe)), 4),
+                    "merged_into": "training rows only; verdict and mean_target stay positive-only"})
+        if hits == 0:
+            raise RuntimeError(
+                f"none of the first {len(probe)} training scenes has a payload under {negative_root}; "
+                f"--negative-target-cache-root points at the wrong root, or the negative Stage-0 build has not run"
+            )
+    mean_target, mean_target_scenes = mean_target_from_cache(dctx, metric_train_dataset, usable_train, args.mean_target_scenes)
     log0(dctx, {"event": "mean_target", "scenes": mean_target_scenes,
                 "shape": list(mean_target.shape), "abs_mean": round(float(mean_target.abs().mean()), 6)})
 
@@ -571,6 +629,9 @@ def main() -> int:
         d_model=args.target_dim,
         heads=args.heads,
         ffn_dim=4 * args.target_dim,
+        # DirectedPairDiT raises unless freq_dim == d_model and defaults freq_dim to
+        # 256, so without this the advertised --target-dim knob only ever worked at 256.
+        freq_dim=args.target_dim,
         depth=args.depth,
         register_target_dim=register_target_dim,
         num_scene_tokens=args.num_scene_tokens,
@@ -684,7 +745,7 @@ def main() -> int:
     # the same reason -- each one is a five-JPEG decode plus a payload read, and 15
     # ranks doing it to sit at a barrier afterwards is pure waste.
     if dctx.main:
-        train_eval_samples, train_skipped = load_eval_samples(train_dataset, usable_train, args.train_metric_scenes)
+        train_eval_samples, train_skipped = load_eval_samples(metric_train_dataset, usable_train, args.train_metric_scenes)
         eval_samples, eval_skipped = (
             load_eval_samples(eval_dataset, usable_eval, args.eval_metric_scenes)
             if eval_dataset is not None
@@ -742,13 +803,22 @@ def main() -> int:
     losses: list[float] = []
     cosines: list[float] = []
     relatives: list[float] = []
+    contrasts: list[float] = []
+    residuals: list[float] = []
+    residual_cosines: list[float] = []
     rows: list[int] = []
+    negative_rows: list[int] = []
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
         epoch_start = time.time()
         for observation, targets, _scene_ids in loader:
+            # Counted before the device move, from metadata rather than from a tensor:
+            # how many rows were mined negatives must stay invisible to the model.
+            negative_rows.append(
+                sum(int(entry.get("negative_rows", 0)) for entry in (observation.camera_metadata or ()))
+            )
             observation = observation_to_device(observation, device)
             targets = targets_to_device(targets, device)
             # The clean GT trajectory is the sigma = 0 end of the same flow Stage 2
@@ -764,7 +834,19 @@ def main() -> int:
 
             with autocast_ctx():
                 predicted = net(observation, source, modes)
-            loss = identity_future_l1(predicted.float(), targets)
+            loss_future = identity_future_l1(predicted.float(), targets)
+            loss = loss_future
+            # The background-free paired term.  The scene mean carries ~60% of the L1
+            # objective and ~79.5% of the rendered future's pixel variance, so the plain
+            # term spends most of its gradient on a quantity the trajectory cannot
+            # change; the contrast term cancels the scene mean exactly and supervises
+            # only the part the trajectories differ in.  Zero opts out.
+            if args.lambda_contrast > 0:
+                loss_contrast = paired_contrast_future_l1(predicted.float(), targets)
+                loss = loss + args.lambda_contrast * loss_contrast
+                contrasts.append(float(loss_contrast.detach()))
+            else:
+                contrasts.append(0.0)
             is_boundary = ((micro + 1) % accum) == 0
             sync_ctx = net.no_sync() if (dctx.enabled and accum > 1 and not is_boundary) else nullcontext()
             with sync_ctx:
@@ -775,6 +857,8 @@ def main() -> int:
             alignment = streaming_future_alignment(predicted, targets)
             cosines.append(alignment["future_cosine_similarity"])
             relatives.append(alignment["future_relative_l1"])
+            residuals.append(alignment["residual_relative_l1"])
+            residual_cosines.append(alignment["residual_cos_future"])
             rows.append(int(targets.gt_valid.sum()))
             micro += 1
             if not is_boundary:
@@ -790,11 +874,14 @@ def main() -> int:
                 window = losses[-args.log_every:]
                 cos_window = cosines[-args.log_every:]
                 rel_window = relatives[-args.log_every:]
+                res_window = residuals[-args.log_every:]
+                resc_window = residual_cosines[-args.log_every:]
+                contrast_window = contrasts[-args.log_every:]
                 # Each rank contributes exactly one window mean, so the all-reduce
                 # counter is 1 per rank.  Passing ``len(window)`` instead divided the
                 # cross-rank mean by the micro-steps per rank as well, reporting a loss
                 # ``log_every``x smaller than the one actually being optimized.
-                # All three series ride a single all-reduce; a second collective per
+                # All five series ride a single all-reduce; a second collective per
                 # logged step would cost more synchronization than the window it reports.
                 reduced = all_reduce_sum(
                     torch.tensor(
@@ -802,13 +889,15 @@ def main() -> int:
                             float(np.mean(window)),
                             float(np.mean(cos_window)),
                             float(np.mean(rel_window)),
+                            float(np.mean(res_window)),
+                            float(np.mean(resc_window)),
                             1.0,
                         ],
                         device=device,
                     ),
                     dctx,
                 )
-                ranks = max(float(reduced[3]), 1.0)
+                ranks = max(float(reduced[5]), 1.0)
                 now = time.time()
                 window_steps = opt_step - window_start_step
                 record = {
@@ -833,7 +922,25 @@ def main() -> int:
                     "relative_l1_future": round(float(relatives[-1]), 6),
                     "mean_relative_l1_future": round(float(np.mean(rel_window)), 6),
                     "all_rank_mean_relative_l1_future": round(float(reduced[2] / ranks), 6),
+                    # The background-removed twins, and the two numbers to actually watch.
+                    # The scene mean of the target carries 59.8% of the L1 objective
+                    # (measured on 400 cached scenes), so ``cos_future`` is dominated by a
+                    # direction the model gets right for free -- the retired 8-token run
+                    # read cos 0.6555 with both gains negative.  ``residual_relative_l1``
+                    # subtracts each side's own scene mean: 1.0 is exactly "reads the
+                    # scene, ignores the trajectory", and only a value below 1.0 is
+                    # evidence the trajectory changed the prediction.
+                    "residual_relative_l1": round(float(residuals[-1]), 6),
+                    "all_rank_mean_residual_relative_l1": round(float(reduced[3] / ranks), 6),
+                    "residual_cos_future": round(float(residual_cosines[-1]), 6),
+                    "all_rank_mean_residual_cos_future": round(float(reduced[4] / ranks), 6),
+                    # The background-free paired term, reported alongside the plain one so
+                    # the two can be read against each other: if the plain L1 falls while
+                    # this stays flat, the model is buying background, not trajectory.
+                    "loss_contrast": round(float(contrasts[-1]), 6),
+                    "mean_loss_contrast": round(float(np.mean(contrast_window)), 6),
                     "supervised_gt_rows": int(rows[-1]),
+                    "negative_gt_rows": int(negative_rows[-1]) if negative_rows else 0,
                     "global_batch_scenes": args.batch_size * dctx.world * accum,
                     # ``sec_per_step`` is the cumulative mean since (re)start and is kept
                     # under its old name for anything already parsing it, but on its own it
@@ -867,7 +974,7 @@ def main() -> int:
 
     scorer_audit = None
     if args.check_scorer and dctx.main:
-        observation, targets, _ = collate_stage1_batch([train_dataset[0]])
+        observation, targets, _ = collate_stage1_batch([metric_train_dataset[0]])
         observation = observation_to_device(observation, device)
         targets = targets_to_device(targets, device)
         modes = ImmutableModeBuffer().subset(args.candidates).to(device)

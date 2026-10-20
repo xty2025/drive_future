@@ -530,8 +530,19 @@ def main() -> int:
     tokens = read_scene_index(dctx, args)
     if not tokens:
         raise FileNotFoundError(f"no ready Multi-GT scene under {args.multiview_root}")
-    train_tokens, eval_tokens = split_scene_tokens(tokens, args.eval_scenes, args.seed)
-    log(dctx, {"event": "split", "scenes": len(tokens), "train": len(train_tokens), "eval": len(eval_tokens)})
+    # ``--limit`` exists for first subset builds, but the split refuses an eval count that
+    # leaves no training scene, so any limit below the default 256 used to die here with a
+    # ValueError before a single payload was written.  Clamping to ``len - 1`` fixed the
+    # crash but ate the train split instead (limit 20 -> 19 eval, 1 train, and Stage 1's
+    # drop_last DataLoader then had no batch), so the cap mirrors the trainer's own
+    # sidecar-less fallback: at most one eighth of the index evaluates.  On the full
+    # corpus the min is a no-op, so the production split is bit-identical.  The clamped
+    # value is what the manifest records, because the trainer re-derives the split from
+    # it and the two must agree on which scenes the standardizer was fit under.
+    eval_scenes = min(int(args.eval_scenes), max(1, len(tokens) // 8))
+    train_tokens, eval_tokens = split_scene_tokens(tokens, eval_scenes, args.seed)
+    log(dctx, {"event": "split", "scenes": len(tokens), "train": len(train_tokens), "eval": len(eval_tokens),
+               "eval_scenes_requested": int(args.eval_scenes), "eval_scenes_used": eval_scenes})
 
     teacher = TimmDinoV3Teacher(checkpoint=args.dino_checkpoint, image_hw=tuple(args.teacher_image_hw)).to(dctx.device)
     if not standardizer_path(args.target_cache_root).exists() or args.overwrite:
@@ -607,7 +618,7 @@ def main() -> int:
                 "teacher_image_hw": [int(args.teacher_image_hw[0]), int(args.teacher_image_hw[1])],
                 "register_target_dim": int(standardizer.state.feature_dim),
                 "seed": int(args.seed),
-                "eval_scenes": int(args.eval_scenes),
+                "eval_scenes": eval_scenes,
                 "skip_degenerate": bool(args.skip_degenerate),
                 "scene_index_count": len(tokens),
                 "train_scene_count": len(train_tokens),
