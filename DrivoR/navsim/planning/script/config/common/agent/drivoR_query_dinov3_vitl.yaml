@@ -1,0 +1,15 @@
+defaults:
+  - drivoR_query_register_dinov3_vitl
+  - _self_
+
+_target_: navsim.agents.drivoR_query_register.gt_variants.DrivoRQueryGTAgent
+
+# Shared ordinary-Transformer control. No Action-DiT/diffusion is constructed.
+config:
+  multi_gt:
+    enabled: false
+  future_register:
+    enabled: false
+    frames_root: null
+    scorer:
+      enabled: false

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Independent register experiments, each followed by head-node FP32 navtest.
+# Train then navtest.  
 DRIVOR_REGISTER_VARIANT="${1:?Specify register, register_scorer, register_scorer_single_gt, register_staged, pseudo_expert_vmse_register or pseudo_expert_vmse_register_scorer}"
 shift
 case "${DRIVOR_REGISTER_VARIANT}" in
@@ -31,6 +31,7 @@ done
 DRIVOR_EXPERIMENT="${DRIVOR_TRAIN_EXPERIMENT}" \
 bash "${DRIVOR_REGISTER_SCRIPT}" \
     auto_resume=false train_ckpt_path=null runtime.require_resume=false runtime.console_log_interval=25 "$@"
+# Keep active Bash reader offsets compatible.       
 
 if [[ "${NODE_RANK:-${RANK:-${SLURM_NODEID:-0}}}" == 0 ]]; then
     DRIVOR_REGISTER_CKPT="$(/usr/bin/python3 - "${NAVSIM_EXP_ROOT}/ke/${DRIVOR_REGISTER_FINAL_EXP}/${DRIVOR_RUN_ID}" <<'PY'
@@ -47,3 +48,11 @@ PY
     bash "${DRIVOR_REGISTER_ROOT}/scripts/evaluation/run_drivor_action_dit_dinov3_vitl_register_evaluation.sh" \
         "${DRIVOR_REGISTER_VARIANT}" "${DRIVOR_REGISTER_CKPT}"
 fi
+
+# DLC_POST_RUN_RETENTION_20261020: opt-in only for the four verified running jobs.
+case "${DRIVOR_RUN_ID:-}" in
+    action_dit_human_diverse8_l1_seed2_dlc_20261020_095054|action_dit_human_diverse8_vmse_seed2_dlc_20261020_095054|dinov3_register_scorer_single_gt_seed2_train_eval_run1|action_dit_pe_vmse_register_scorer_seed2_train_eval_run1)
+        /usr/bin/python3 "/cpfs29jb/data/zhaozc/project/drive_future/environment/dlc_tail_retention.py" \
+            --control "/cpfs29jb/data/zhaozc/project/drive_future/artifacts/dlc_workspace_26585/retention_probe_20261020_210605/control.json"
+        ;;
+esac

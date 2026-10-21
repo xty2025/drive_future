@@ -1,0 +1,16 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_single_gt_long
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit.auxiliary.DrivoRActionDiTAuxiliaryAgent
+
+# Keep ordinary-human + long-human v losses. Add CLOVER physical-coordinate
+# L1 coverage over the ordinary group's same 64 X predictions.
+config:
+  pseudo_expert:
+    enabled: true
+    path: ${oc.env:DRIVOR_PSEUDO_EXPERT_PACK,${oc.env:NAVSIM_EXP_ROOT}/clover_data/pseudo_experts_k8_thr0p8}
+    top_k: 8
+    score_thr: 0.8
+    loss_type: l1
+    weight: 0.5

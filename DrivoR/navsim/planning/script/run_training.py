@@ -38,7 +38,7 @@ def build_dataloader(dataset, params, *, shuffle: bool, seed: int) -> DataLoader
         options["persistent_workers"] = False
     else:
         options.setdefault("persistent_workers", True)
-    options.setdefault("drop_last", True)
+    options.setdefault("drop_last", bool(shuffle))  # Keep the final validation batch.
     options["shuffle"] = shuffle
     # All ranks share this seed; Lightning supplies rank-aware worker_init_fn
     # and a DistributedSampler using the unchanged PL_GLOBAL_SEED.
@@ -148,6 +148,7 @@ def main(cfg: DictConfig) -> None:
         console_log_interval=cfg.get("runtime", {}).get("console_log_interval", 25),
         performance_diagnostics=cfg.get("runtime", {}).get("performance_diagnostics"),
         training_seed=cfg.seed if cfg.get("runtime", {}).get("rank_seeded_training", True) else None,
+        validation_fp32=cfg.get("runtime", {}).get("validation_fp32", True),
     )
 
     if cfg.use_cache_without_dataset:

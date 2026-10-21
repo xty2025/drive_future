@@ -3,11 +3,11 @@ set -euo pipefail
 
 # DLC: train a loss/GT variant on all nodes, then evaluate on node 0 in FP32.
 # Usage: bash run_drivor_action_dit_dinov3_vitl_aux_train_eval.sh <variant> [training overrides]
-DRIVOR_AUX_VARIANT="${1:?Specify bank, pseudo_expert, pseudo_expert_vmse, multigt_poor, single_gt or single_gt_long}"
+DRIVOR_AUX_VARIANT="${1:?Specify bank, pseudo_expert, pseudo_expert_vmse, multigt_poor, single_gt, single_gt_long, human_diverse8_l1 or human_diverse8_vmse}"
 shift
 case "${DRIVOR_AUX_VARIANT}" in
     bank|pseudo_expert|pseudo_expert_vmse) DRIVOR_AUX_SUFFIX="multigt_${DRIVOR_AUX_VARIANT}" ;;
-    multigt_poor|single_gt|single_gt_long) DRIVOR_AUX_SUFFIX="${DRIVOR_AUX_VARIANT}" ;;
+    multigt_poor|single_gt|single_gt_long|human_diverse8_l1|human_diverse8_vmse) DRIVOR_AUX_SUFFIX="${DRIVOR_AUX_VARIANT}" ;;
     *) printf 'Unknown auxiliary variant: %s\n' "${DRIVOR_AUX_VARIANT}" >&2; exit 2 ;;
 esac
 
@@ -64,3 +64,18 @@ PY
         "trainer.params.precision=${DRIVOR_EVAL_PRECISION}" \
         dataloader.params.batch_size=1
 fi
+
+# DLC_POST_RUN_RETENTION_20261020: opt-in only for the four verified running jobs.
+case "${DRIVOR_RUN_ID:-}" in
+    action_dit_human_diverse8_l1_seed2_dlc_20261020_095054|action_dit_human_diverse8_vmse_seed2_dlc_20261020_095054|dinov3_register_scorer_single_gt_seed2_train_eval_run1|action_dit_pe_vmse_register_scorer_seed2_train_eval_run1)
+        /usr/bin/python3 "/cpfs29jb/data/zhaozc/project/drive_future/environment/dlc_tail_retention.py" \
+            --control "/cpfs29jb/data/zhaozc/project/drive_future/artifacts/dlc_workspace_26585/retention_probe_20261020_210605/control.json"
+        ;;
+esac
+
+# DLC_QUERY_GT_CHAIN_chain_query_gt_20261021_164710: append only, exact predecessor RunIDs.
+case "${DRIVOR_RUN_ID:-}" in
+    action_dit_dinov3_vitl_single_gt_long_pseudo_expert_seed2_dlc8hwmx72tdbjoc_chain1)
+        /usr/bin/python3 /cpfs29jb/data/zhaozc/project/drive_future/environment/dlc_tail_once.py --control /cpfs29jb/data/zhaozc/project/drive_future/artifacts/dlc_workspace_26585/chain_query_gt_20261021_164710/control.json
+        ;;
+esac

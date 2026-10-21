@@ -4,6 +4,27 @@
 
 默认均为 **8×8 卡、每卡 batch 1、累积 1、总 batch 64、BF16、25 epochs、seed 2、峰值 LR 2e-4**。各入口都启用 fused AdamW、每卡 4 个数据 workers、2 个 Oracle 进程、CPU threads 1、prefetch 2，以及训练模型的 `seed + global_rank` 随机流。
 
+所有 DrivoR / Action-DiT 入口现在默认**保留每个 epoch 的完整 checkpoint**，并在每轮结束时用 **FP32** 运行 val 规划推理与真实 NAVSIM Oracle PDMS 计算。验证结果记录为 `val/pdms`，原 `val/score_epoch` 是相同值的兼容名称；它表示 Scorer 最终选中轨迹的真实分数，范围0～1。
+
+每个实验目录下输出：
+
+```text
+<output_dir>/
+  val_pdms.csv                          # epoch, global_step, val_scenes, val_pdms, precision
+  lightning_logs/version_*/checkpoints/
+    epoch=0-step=....ckpt
+    epoch=1-step=....ckpt
+    ...                                 # 每轮均保留，含 optimizer/scheduler/EMA 等完整状态
+    last.ckpt                           # 最近一轮，可恢复训练
+    best-epoch=...-step=....ckpt          # val PDMS 最优的一轮
+```
+
+CSV 的 epoch 与 checkpoint 一样从0开始；重复验证同一 epoch 时更新该行。val 默认使用完整集合并保留尾批，多卡 sampler 为补齐长度而重复的场景按 token 去重后计算 PDMS。训练精度仍为 BF16，`runtime.validation_fp32=true` 单独控制验证精度；共享启动脚本明确设置 `check_val_every_n_epoch=1`、`val_check_interval=1.0`、`limit_val_batches=1.0`。
+
+现有启动命令可继续使用。已启动的训练进程需要重新启动并从本次 `last.ckpt` 恢复后才会采用新代码。仅未来表征的 `register_stage1` 没有轨迹输出，仍验证 future loss；它同样保存每轮 checkpoint，联合训练阶段才计算规划 PDMS。
+
+该流程已通过32项checkpoint/验证/runtime检查、10项启动检查，以及两卡3个真实val场景的smoke；验证记录见 [validation.json](../../../artifacts/epoch_checkpoints_val_pdms_20261019/validation.json)。
+
 | 模型 | 脚本 | 当前行为 |
 |---|---|---|
 | 原版 DrivoR | `run_drivor_training.sh` | 四路当前图像，原版轨迹生成器与 Scorer |
@@ -23,6 +44,13 @@
 | Action-DiT + DINOv3-L 未来 registers | `run_drivor_action_dit_dinov3_vitl_register_training.sh` | 64 对轨迹/32-register；EMA teacher，多 GT 同索引监督，原 Scorer |
 | Action-DiT + DINOv3-L register Scorer | `run_drivor_action_dit_dinov3_vitl_register_scorer_training.sh` | Registers 压缩到256，与轨迹特征 concat→MLP 评分，两类预测 detach |
 | Action-DiT + DINOv3-L register Scorer 单 GT | `run_drivor_action_dit_dinov3_vitl_register_scorer_single_gt_training.sh` | Human GT best-of-64，同候选 registers 对齐真实 human 未来帧；不读取 Cosmos 多 GT |
+| 普通 Transformer + registers 单 GT | `run_drivor_query_register_single_gt_training.sh` | 64 个可学习 Action queries，每候选 32 个 Future queries；human GT L1＋EMA future L1，原 Scorer |
+| 普通 Transformer + registers 多 GT | `run_drivor_query_register_multigt_training.sh` | top4 有效 GT 独立最近匹配、等权平均；同索引 future 对齐，原 Scorer |
+| 普通 Transformer + 融合 Scorer 单 GT | `run_drivor_query_register_scorer_single_gt_training.sh` | human GT；预测 registers 压缩后与轨迹特征 concat→MLP 评分，两类预测 detach |
+| 普通 Transformer + 融合 Scorer 多 GT | `run_drivor_query_register_scorer_multigt_training.sh` | top4 等权多 GT；使用相同的融合 Scorer |
+| 普通 Transformer human＋长 GT 基线 | `run_drivor_query_single_gt_long_training.sh` | 同组 64 proposals 分别取 human/长 GT L1；不构造未来分支或 EMA teacher |
+| 普通 Transformer human＋长 GT＋register | `run_drivor_query_single_gt_long_register_training.sh` | 保留两项轨迹 L1；普通 human winner 配对真实未来 register L1，原 Scorer |
+| 普通 Transformer human＋diverse8 基线 | `run_drivor_query_human_diverse8_l1_training.sh` | human L1＋0.5×新的 diverse8 L1 coverage；无长 GT、无未来分支 |
 | Action-DiT + DINOv3-L register 分阶段 | `run_drivor_action_dit_dinov3_vitl_register_staged_training.sh` | 先 GT 条件未来去噪，再联合 Action/Register/Scorer；延续 EMA |
 | Action-DiT + DINOv3-L 原 top4＋poor4 | `run_drivor_action_dit_dinov3_vitl_multigt_poor_training.sh` | 合并最多 8 条有效 GT，原最近邻 v loss 等权平均 |
 | Action-DiT + DINOv3-L 原始单 GT | `run_drivor_action_dit_dinov3_vitl_single_gt_training.sh` | 仅原始 human GT，best-of-64 v loss |
@@ -30,6 +58,10 @@
 | Action-DiT + DINOv3-L 多 GT + Bank | `run_drivor_action_dit_dinov3_vitl_bank_training.sh` | 保留原 multi-GT v loss，Scorer 额外处理 16 条 Bank 候选，L_Bank ×0.5 |
 | Action-DiT + DINOv3-L 多 GT + pseudo-expert | `run_drivor_action_dit_dinov3_vitl_pseudo_expert_training.sh` | 保留原 multi-GT v loss，同一次 X-prediction 额外计算 CLOVER L1 coverage ×0.5 |
 | Action-DiT + DINOv3-L 多 GT + pseudo-expert v MSE | `run_drivor_action_dit_dinov3_vitl_pseudo_expert_vmse_training.sh` | Pseudo-expert 也复用原 multi-GT X→v MSE，独立平均后 ×0.5；旧 L1 版保留 |
+| Action-DiT + human GT + diverse8 L1 | `run_drivor_action_dit_dinov3_vitl_human_diverse8_l1_training.sh` | Human主v loss，新选中有效生成轨迹的L1 coverage×0.5；不读旧top4/CLOVER |
+| Action-DiT + human GT + diverse8 vMSE | `run_drivor_action_dit_dinov3_vitl_human_diverse8_vmse_training.sh` | 同一主human和64份加噪输入，额外生成GT改用vMSE×0.5 |
+| Action-DiT + human X-L1 + diverse8 L1 | `run_drivor_action_dit_dinov3_vitl_human_xl1_diverse8_l1_training.sh` | Human 直接物理坐标 best-of-64 L1；diverse8 L1 coverage×0.5；原 Scorer |
+| Action-DiT + human/长 GT X-L1 | `run_drivor_action_dit_dinov3_vitl_single_gt_long_xl1_training.sh` | 普通和长 GT 都使用直接物理坐标 best-of-64 L1，两项相加；一次合批 DiT 前向 |
 | Action-DiT + pseudo-expert v MSE + registers | `run_drivor_action_dit_dinov3_vitl_pseudo_expert_vmse_register_training.sh` | 同次前向联合生成 64 对轨迹/registers；原 Scorer；未来监督对应原 top4 视频 |
 | Action-DiT + pseudo-expert v MSE + register Scorer | `run_drivor_action_dit_dinov3_vitl_pseudo_expert_vmse_register_scorer_training.sh` | 上一版基础上，预测 registers 压缩后与轨迹特征 concat→MLP 评分，两者 detach |
 | Action-DiT + V-JEPA 2 ViT-L | `run_drivor_action_dit_vjepa2_vitl_training.sh` | 冻结官方预训练 ViT-L，Q/V LoRA；单前视 patches、等权多 GT，queries 可选 |
@@ -41,6 +73,18 @@
 | 原版 DrivoR + V-JEPA 2 + 多GT未来预测 | `run_drivor_vjepa2_world_multigt_training.sh` | 每GT独立最近邻，允许重复proposal，等权平均；Cosmos对应未来帧 |
 
 以下命令显式指定实验目录，避免继承 shell 中其他模型的 `DRIVOR_EXPERIMENT`。需要分段计时时，可设置 `DRIVOR_PERF_ENABLED=true DRIVOR_PERF_SAMPLE_EVERY=10`；不添加额外的跨 rank 统计同步。
+
+## 新增：Action-DiT 的直接 X-prediction L1
+
+两个新对照为 `human_xl1_diverse8_l1` 和 `single_gt_long_xl1`。两组对应的 `*_train_eval.sh` 会自动 FP32 navtest。完整 loss、配置及 DLC 命令见 [Action-DiT X L1](../../DRIVOR_ACTION_DIT_X_L1.md)。
+
+## 新增：普通 Transformer Action/Future queries
+
+新增三个统一骨干的公平对照：human＋长 GT、human＋长 GT＋register、human＋diverse8。三个新配置共享参数初始化顺序，无 register 时完全不构造预测头或 teacher。对应 `*_train_eval.sh` 都会自动 FP32 navtest；完整配置和命令见 [三个 GT 对照](../../DRIVOR_QUERY_GT_BASELINES.md)。
+
+原有四个 Action/Future query 版本共用 DINOv3-L 当前单前视、4 层普通 DrivoR Transformer、64 个 Action queries 和每候选 32 个 Future queries。没有 Action-DiT 加噪或多步推理；轨迹用直接 L1，Future 用 EMA teacher register L1。
+
+训练后自动 **FP32 navtest** 的入口为 `run_drivor_query_register_<版本>_train_eval.sh`，版本分别为 `single_gt`、`multigt`、`scorer_single_gt`、`scorer_multigt`。后两组在 Scorer 中融合轨迹与预测 registers。四组使用独立输出目录，完整命令、配置和网络结构见 [普通 Transformer queries](../../DRIVOR_QUERY_REGISTER.md)。
 
 ## 新增：DINOv3-L Action-DiT 未来 registers 与 EMA teacher
 

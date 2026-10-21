@@ -1,0 +1,11 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_single_gt_long
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit.x_l1.DrivoRActionDiTXL1Agent
+
+# Ordinary human and long human GT each take their own best-of-64 physical X L1.
+# Preserve the two noisy groups packed into one DiT forward and sum both losses.
+config:
+  action_dit:
+    loss_reduction: best_of_k

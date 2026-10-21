@@ -141,6 +141,9 @@ exec "${DRIVOR_LAUNCH[@]}" "${NAVSIM_DEVKIT_ROOT}/navsim/planning/script/run_tra
     cache_path=null \
     use_cache_without_dataset=false \
     trainer.params.max_epochs=25 \
+    trainer.params.check_val_every_n_epoch=1 \
+    trainer.params.val_check_interval=1.0 \
+    trainer.params.limit_val_batches=1.0 \
     "++trainer.params.devices=${DRIVOR_GPUS_PER_NODE}" \
     "trainer.params.num_nodes=${DRIVOR_NNODES}" \
     trainer.params.strategy=ddp \
@@ -154,6 +157,7 @@ exec "${DRIVOR_LAUNCH[@]}" "${NAVSIM_DEVKIT_ROOT}/navsim/planning/script/run_tra
     "runtime.require_resume=${DRIVOR_REQUIRE_RESUME:-false}" \
     "runtime.rank_seeded_training=${DRIVOR_RANK_SEEDED_TRAINING:-true}" \
     "runtime.console_log_interval=${DRIVOR_CONSOLE_LOG_INTERVAL:-25}" \
+    "runtime.validation_fp32=${DRIVOR_VAL_FP32:-true}" \
     dataloader.params.persistent_workers=true \
     dataloader.params.pin_memory=true \
     dataloader.params.batch_size=1 \

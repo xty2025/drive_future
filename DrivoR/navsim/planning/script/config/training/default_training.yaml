@@ -27,6 +27,7 @@ runtime:
   rank_seeded_training: true  # Model RNG = seed + global_rank after DDP setup; sampler seed stays common.
   log_local_steps: true
   console_log_interval: 25
+  validation_fp32: true  # Validate the planner in FP32 even with BF16 mixed training.
   performance_diagnostics:
     enabled: false
     output_dir: ${output_dir}/performance

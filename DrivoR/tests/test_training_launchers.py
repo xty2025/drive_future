@@ -28,6 +28,8 @@ import pytest
                         "run_drivor_action_dit_dinov3_vitl_bank_training.sh",
                         "run_drivor_action_dit_dinov3_vitl_pseudo_expert_training.sh",
                         "run_drivor_action_dit_dinov3_vitl_pseudo_expert_vmse_training.sh",
+                        "run_drivor_action_dit_dinov3_vitl_human_diverse8_l1_training.sh",
+                        "run_drivor_action_dit_dinov3_vitl_human_diverse8_vmse_training.sh",
                         "run_drivor_action_dit_dinov3_vitl_pseudo_expert_vmse_register_training.sh",
                         "run_drivor_action_dit_dinov3_vitl_pseudo_expert_vmse_register_scorer_training.sh",
                         "run_drivor_action_dit_dinov3_vitl_multigt_poor_training.sh",
@@ -93,6 +95,10 @@ def test_dlc_environment_launches_64_ranks_without_manual_node_arguments(launche
     assert config["trainer.params.devices"] == "8" and config["trainer.params.num_nodes"] == "8"
     assert config["agent.num_gpus"] == "64"
     assert int(config["dataloader.params.batch_size"]) * int(config["agent.num_gpus"]) * int(config["trainer.params.accumulate_grad_batches"]) == 64
+    assert config['trainer.params.check_val_every_n_epoch']=='1'
+    assert config['trainer.params.val_check_interval']=='1.0'
+    assert config['trainer.params.limit_val_batches']=='1.0'
+    assert config['runtime.validation_fp32']=='true'
 
 
 def test_configuration_query_does_not_need_a_dlc_job(launcher):

@@ -2,6 +2,8 @@
 
 基于本版新增的两组未来 register 实验、DLC 训练及 FP32 测试命令见 [pseudo-expert + registers](DRIVOR_ACTION_DIT_PSEUDO_EXPERT_VMSE_REGISTERS.md)。
 
+另有以human为主GT、用新生成diverse8替代原CLOVER专家的两组实验，见 [human + diverse8](DRIVOR_ACTION_DIT_HUMAN_DIVERSE8.md)。
+
 这是基于 `run_drivor_action_dit_dinov3_vitl_pseudo_expert_training.sh` 新增的独立实验。旧脚本与旧配置继续使用物理坐标 L1 coverage；新入口是：
 
 ```text

@@ -1,0 +1,17 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_single_gt
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit.diverse_gt.DrivoRActionDiTDiverseGTAgent
+
+# Human best-of-64 v MSE + 0.5 * selected diverse8 physical-coordinate L1.
+# Internal pseudo_expert keys reuse the existing objective; source is diverse8.
+config:
+  pseudo_expert:
+    enabled: true
+    source: diverse8
+    path: ${oc.env:DRIVOR_DIVERSE8_GT_ROOT,/cpfs29jb/data/zhaozc/project/Cosmos3forMultiGT/runtime/multigt_raw64/outputs/navtrain_diverse8_dense_0p1s_f64}
+    top_k: 8
+    loss_type: l1
+    weight: 0.5
+    missing_policy: ignore

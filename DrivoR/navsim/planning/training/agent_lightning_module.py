@@ -1,6 +1,7 @@
 from time import sleep
 from time import perf_counter
 from collections import deque
+from contextlib import nullcontext
 import logging
 import math
 
@@ -12,6 +13,7 @@ from typing import Dict, Tuple, Any, List
 from navsim.common.dataclasses import Trajectory
 from navsim.planning.training.rank_performance import RankPerformanceRecorder
 from navsim.planning.training.random_seed import seed_model_randomness
+from navsim.planning.training.validation_pdms import summarize_scene_pdms, write_epoch_pdms
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import Trajectory
 
@@ -86,7 +88,8 @@ class AgentLightningModule(pl.LightningModule):
     """Pytorch lightning wrapper for learnable agent."""
 
     def __init__(self, agent: AbstractAgent, for_viz=False, log_local_steps=True,
-                 console_log_interval=25, performance_diagnostics=None, training_seed=None):
+                 console_log_interval=25, performance_diagnostics=None, training_seed=None,
+                 validation_fp32=True):
         """
         Initialise the lightning module wrapper.
         :param agent: agent interface in NAVSIM
@@ -105,6 +108,8 @@ class AgentLightningModule(pl.LightningModule):
         self._performance = None
         self.training_seed = int(training_seed) if training_seed is not None else None
         self._model_rng_seed = None
+        self.validation_fp32 = bool(validation_fp32)
+        self._validation_pdms = {}
 
     def on_train_start(self) -> None:
         # Parameters and DDP are ready; preserve their common initialization and
@@ -140,6 +145,31 @@ class AgentLightningModule(pl.LightningModule):
         if self._performance is not None:
             self._performance.reset_wait(paused=True)
         self._console_previous_batch_end = None
+
+    def on_validation_epoch_start(self) -> None:
+        self._validation_pdms.clear()
+
+    def on_validation_epoch_end(self) -> None:
+        # All ranks participate, including an empty shard. Only small token /
+        # Oracle-score records are gathered, never images or proposal tensors.
+        records = [self._validation_pdms]
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            records = [None]*torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(records,self._validation_pdms)
+        summary = summarize_scene_pdms(records)
+        if summary is None:
+            return  # e.g. Stage1 future-only training has no planning outputs.
+        pdms = torch.tensor(summary['val_pdms'],device=self.device,dtype=torch.float32)
+        # Keep the existing best-checkpoint monitor as an alias of true PDMS.
+        for name in ('val/pdms','val/score_epoch'):
+            self.log(name,pdms,on_step=False,on_epoch=True,prog_bar=True,sync_dist=True)
+        self.log('val/num_scenes',float(summary['val_scenes']),on_step=False,on_epoch=True,sync_dist=True)
+        if self.global_rank == 0 and not self.trainer.sanity_checking:
+            precision = '32-true' if self.validation_fp32 else 'training'
+            path = write_epoch_pdms(self.trainer.default_root_dir,self.current_epoch,
+                                    self.global_step,summary,precision)
+            logger.info('[val] epoch=%s scenes=%s PDMS=%.6f precision=%s history=%s',
+                        self.current_epoch+1,summary['val_scenes'],summary['val_pdms'],precision,path)
 
     def on_validation_end(self) -> None:
         # Validation/checkpoint callbacks finish before this hook. Start a new
@@ -209,7 +239,7 @@ class AgentLightningModule(pl.LightningModule):
         metrics = self.trainer.callback_metrics
         if self.global_rank == 0:
             keys = ("train/loss", "train/trajectory_loss", "train/future_register_loss", "train/ema_updates", "train/final_score_loss", "train/score",
-                    "train/best_score", "val/score_epoch", "val/best_score", "val/mean_score",
+                    "train/best_score", "val/pdms", "val/score_epoch", "val/num_scenes", "val/best_score", "val/mean_score",
                     "val/lost_score", "val/score_hit_rate", "val/l2", "val/future_register_loss")
             summary = " ".join(f"{key}={_format_scalar(metrics[key])}" for key in keys if key in metrics)
             logger.info("[epoch] epoch=%s scope=global %s", self.current_epoch + 1, summary)
@@ -315,10 +345,17 @@ class AgentLightningModule(pl.LightningModule):
             features, targets = batch
             batch_size = _batch_size(features, targets)
             # score,best_score=self.agent.inference(features, targets)
-            predictions = self.agent.forward(features)
+            # Mixed-precision training leaves model weights/input tensors in
+            # FP32. Disable validation autocast to evaluate the actual planner
+            # in FP32 without changing the training precision or optimizer.
+            context = torch.autocast(device_type=self.device.type,enabled=False) if self.validation_fp32 else nullcontext()
+            with context:
+                predictions = self.agent.forward(features)
             all_chosen_trajectories = predictions["trajectory"][:,None]
             all_proposed_trajectories = predictions["proposals"]
             final_score, fake_best_score, proposal_scores, l2, trajectoy_scores = self.agent.compute_score(targets, all_chosen_trajectories)
+            for token,score in zip(targets['token'],proposal_scores[:,0].detach().float().cpu().tolist()):
+                self._validation_pdms.setdefault(str(token),score)
             _, best_score, all_proposal_scores, _, _ = self.agent.compute_score(targets, all_proposed_trajectories)
             mean_score=all_proposal_scores.mean()
 
@@ -341,9 +378,8 @@ class AgentLightningModule(pl.LightningModule):
                 top_5_score_hit_rate = _rowwise_isin(best_pred_score_index, top_5_indices_real).mean(dtype=torch.float32)
                 self.log(f"{logging_prefix}/top_5_score_hit_rate", top_5_score_hit_rate, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
             
-            # Preserve the checkpoint monitor produced by the previous dual
-            # step/epoch log without doing a collective on every validation step.
-            self.log(f"{logging_prefix}/score_epoch", final_score, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
+            # Final selected PDMS is aggregated by unique scene token at epoch
+            # end; a plain batch mean would count DDP padding scenes twice.
             self.log(f"{logging_prefix}/best_score", best_score, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
             self.log(f"{logging_prefix}/mean_score", mean_score, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
             self.log(f"{logging_prefix}/l2", l2, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)

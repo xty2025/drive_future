@@ -1,5 +1,13 @@
 # 已训练 Action-DiT 的 navtest 评测
 
+普通 Transformer 的三组 GT 对照使用 `run_drivor_query_gt_evaluation.sh <single_gt_long|single_gt_long_register|human_diverse8_l1> <checkpoint>`，固定 FP32；所选配置决定是否构造未来分支，推理无需未来 RGB 或 GT 数据。训练和自动测试命令见 [三个 GT 对照](../../DRIVOR_QUERY_GT_BASELINES.md)。
+
+`human_xl1_diverse8_l1` / `single_gt_long_xl1` 只替换训练轨迹 loss，测试沿用普通 DINOv3-L Action-DiT 网络和 10 步 Euler。两组独立 `*_train_eval.sh` 自动进行 FP32 navtest，命令见 [Action-DiT X L1](../../DRIVOR_ACTION_DIT_X_L1.md)。
+
+普通 Transformer Action/Future queries 使用 [run_drivor_query_register_evaluation.sh](run_drivor_query_register_evaluation.sh) 加完整 checkpoint 路径，固定 FP32。融合 Scorer 的 checkpoint 需追加 `agent.config.future_register.scorer.enabled=true`。四个训练后自动测试入口已分别选择对应的 Scorer 配置；完整命令见 [普通 Transformer queries](../../DRIVOR_QUERY_REGISTER.md)。
+
+新的 `human_diverse8_l1` / `human_diverse8_vmse` 只改变训练监督，测试使用普通DINOv3-L Action-DiT结构。训练后自动FP32 navtest命令见 [human + diverse8](../../DRIVOR_ACTION_DIT_HUMAN_DIVERSE8.md)。
+
 新的 DINOv3-L Action/Register 联合去噪模型使用 `run_drivor_action_dit_dinov3_vitl_register_evaluation.sh <register|register_scorer|register_staged> <checkpoint>`，默认 FP32、每卡 batch1、32 个 CPU 评分进程。三个训练后自动测试命令见 [未来 register 说明](../../DRIVOR_ACTION_DIT_DINOV3_REGISTERS.md)。
 
 其单 human GT 对照使用参数 `register_scorer_single_gt`，测试模型结构仍为 register Scorer、默认 FP32。训练与自动测试命令见 [单 GT 对照](../../DRIVOR_ACTION_DIT_REGISTER_SINGLE_GT.md)。

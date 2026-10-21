@@ -267,7 +267,10 @@ class DrivoRAgent(AbstractAgent):
                                         mode="max"
                                         )
         
-        checkpoint_cb = ModelCheckpoint(save_last=True)
+        # Keep every completed epoch for later comparison/resume. Validation
+        # runs at the end of the epoch before this training-epoch-end callback.
+        checkpoint_cb = ModelCheckpoint(save_top_k=-1, save_last=True,
+                                        every_n_epochs=1, save_on_train_epoch_end=True)
 
         lr_monitor = LearningRateMonitor(logging_interval="step", 
                                             log_momentum=False,

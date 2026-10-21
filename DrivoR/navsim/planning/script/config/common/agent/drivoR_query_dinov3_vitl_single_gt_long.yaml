@@ -1,0 +1,8 @@
+defaults:
+  - drivoR_query_dinov3_vitl
+  - _self_
+
+# One shared set of 64 proposals: human L1 + long-GT L1 + score loss.
+# No future queries, register head, teacher or future RGB targets.
+config:
+  long_trajectory_additional_poses: 2
