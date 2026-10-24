@@ -1,6 +1,6 @@
-# 半量 navtrain：A23 / A27 / A28 及 A28 的 10 组独立改动
+# 半量 navtrain：A23 / A27 / A28 及 A28 的 12 组独立改动
 
-共 **13 个实验**。三个基线和十个改动均使用 `run_training.py`、同一份 42,555 场景的 `navtrain_half`；原 val 18,179 场景保留用于每轮验证。十个改动的 agent 配置都直接继承原 A28，互不叠加。
+共 **15 个实验**。三个基线和十二个改动均使用 `run_training.py`、同一份 42,555 场景的 `navtrain_half`；原 val 18,179 场景保留用于每轮验证。十二个改动的 agent 配置都直接继承原 A28，互不叠加。
 
 新的输出根目录是 `DrivoR/exp/navtrain_half_ablations/`；下面每个实验有独立训练、权重和 navtest 目录。RGB/OSS 缓存继续复用原目录，不会因切换输出根目录而重建视频缓存。
 
@@ -21,6 +21,10 @@
 | 改动 8 | DiT 3072/FFN14336，直接加载原生 Wan2.2 5B block/time 权重 | 32 | EMA DINOv3 register | 进入 | [half_a28_wan5b.yaml](navsim/planning/script/config/training/half_a28_wan5b.yaml) |
 | 改动 9 | 每张未来帧独立经冻结 Wan2.2 VAE，再池化为 16 个 token | 128 | 冻结 Wan2.2 VAE，48 维 | 进入 | [half_a28_vae16.yaml](navsim/planning/script/config/training/half_a28_vae16.yaml) |
 | 改动 10 | human 和有效 D8 分组初始化 action/future 噪声锚点；loss 不变 | 32 | EMA DINOv3 register | 进入 | [half_a28_grouped_noise.yaml](navsim/planning/script/config/training/half_a28_grouped_noise.yaml) |
+| 改动 11 | MoT：Wan5B register expert＋原 Action256；R 读 A、A 不读 R | 32 | EMA DINOv3 register | 进入 | [half_a28_mot.yaml](navsim/planning/script/config/training/half_a28_mot.yaml) |
+| 改动 12 | 单独使用 Wan2.1 1.3B joint DiT，替换改动 8 的 Wan2.2 5B | 32 | EMA DINOv3 register | 进入 | [half_a28_wan21_1p3b.yaml](navsim/planning/script/config/training/half_a28_wan21_1p3b.yaml) |
+
+2026-10-25 新增 MoT 和 Wan2.1 1.3B 已提交为独立任务，详见 [新增两组部署记录](exp/navtrain_half_ablations/dlc_deployment_mot_wan21_20261025_004807/README.md)。
 
 ## 共同训练设置
 
@@ -33,6 +37,8 @@
 - A27/A28 及其改动：未来时刻仍为 +0.5、+1.0……+4.0 秒，视频取零基帧 5、10……40。human 用真实未来前视，D8 用各自生成视频；不改变既有抽帧与配对。
 - A28 的 Scorer 始终对同一组 64 条预测评分：轨迹特征和压缩后的预测未来特征 concat→MLP，后接原 256 维 DrivoR Scorer。输入的轨迹和未来预测都 detach；原视觉/ego 分支的梯度路径保留。
 - 每个 epoch 保存权重并在完整 val 上进行 FP32 PDMS 验证，训练结束自动对 `last.ckpt` 进行 FP32 navtest。该 val 不参加本组训练。
+
+新增 MoT 与 Wan2.1 的结构、权重和命令详见 [两组新增实验](DRIVOR_HALF_MOT_WAN21.md)。
 
 ## 各改动的边界
 
@@ -103,6 +109,12 @@ bash DrivoR/scripts/training/run_drivor_half_a28_vae16_train_eval.sh
 
 # 改动 10：human 和有效 D8 分组初始化 action/future 噪声锚点；loss 不变
 bash DrivoR/scripts/training/run_drivor_half_a28_grouped_noise_train_eval.sh
+
+# 改动 11：MoT，Register 能看见 Action
+bash DrivoR/scripts/training/run_drivor_half_a28_mot_train_eval.sh
+
+# 改动 12：Wan2.1 1.3B joint DiT
+bash DrivoR/scripts/training/run_drivor_half_a28_wan21_1p3b_train_eval.sh
 
 ```
 

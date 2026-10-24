@@ -5,7 +5,7 @@ case "${DRIVOR_HALF_VARIANT}" in
     a23) DRIVOR_HALF_AGENT=drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1 ;;
     a27) DRIVOR_HALF_AGENT=drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register ;;
     a28) DRIVOR_HALF_AGENT=drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer ;;
-    a28_random_dit|a28_patch16|a28_register_first|a28_bidirectional|a28_shared_vit|a28_frozen_vit|a28_dit1024|a28_wan5b|a28_vae16|a28_grouped_noise)
+    a28_random_dit|a28_patch16|a28_register_first|a28_bidirectional|a28_shared_vit|a28_frozen_vit|a28_dit1024|a28_wan5b|a28_vae16|a28_grouped_noise|a28_mot|a28_wan21_1p3b)
         DRIVOR_HALF_AGENT="drivoR_half_${DRIVOR_HALF_VARIANT}" ;;
     *) printf 'Unknown half-data experiment: %s\n' "${DRIVOR_HALF_VARIANT}" >&2; exit 2 ;;
 esac
@@ -29,7 +29,7 @@ export DRIVOR_VAL_FP32=true
 export DRIVOR_EVAL_PRECISION=32-true
 DRIVOR_HALF_STRATEGY=ddp
 DRIVOR_HALF_PRECISION="${DRIVOR_PRECISION:-bf16-mixed}"
-if [[ "${DRIVOR_HALF_VARIANT}" == a28_wan5b ]]; then
+if [[ "${DRIVOR_HALF_VARIANT}" == a28_wan5b || "${DRIVOR_HALF_VARIANT}" == a28_mot || "${DRIVOR_HALF_VARIANT}" == a28_wan21_1p3b ]]; then
     DRIVOR_HALF_STRATEGY=deepspeed_stage_2
     # The model opts into BF16 forward autocast, keeping FP32 master parameters
     # for the same FP32 epoch validation as the smaller A28 experiments.

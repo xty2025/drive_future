@@ -34,10 +34,19 @@ class DrivoRActionRegisterModel(DrivoRActionDiTModel):
         self.registers_per_frame = self.ema_teacher.register_count
         self.register_dim = self.ema_teacher.dim
         self.register_count = self.register_frames*self.registers_per_frame
-        self.action_dit = ActionRegisterDiT(self.action_dit,self.register_dim,self.poses_num,
-            self.register_frames,self.registers_per_frame,
-            token_order=options.get('token_order', 'action_first'),
-            attention_mode=options.get('attention_mode', 'register_reads_action'))
+        generator_kind = options.get('generator_kind', 'joint')
+        if generator_kind == 'mot':
+            from .mot import ActionRegisterMoT
+            self.action_dit = ActionRegisterMoT(self.action_dit, options.mot.video_dit,
+                self.register_dim, context_dim=config.tf_d_model, action_tokens=self.poses_num,
+                future_frames=self.register_frames, registers_per_frame=self.registers_per_frame)
+        elif generator_kind == 'joint':
+            self.action_dit = ActionRegisterDiT(self.action_dit,self.register_dim,self.poses_num,
+                self.register_frames,self.registers_per_frame,
+                token_order=options.get('token_order', 'action_first'),
+                attention_mode=options.get('attention_mode', 'register_reads_action'))
+        else:
+            raise ValueError(f'Unknown future-register generator_kind: {generator_kind}')
         if self.use_register_scorer:
             width = self.register_count*self.register_dim
             if self.register_fusion == 'flatten':

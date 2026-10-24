@@ -2,7 +2,7 @@
 
 新增 `navtrain_half`：训练场景从 **85,109 减为 42,555**，验证仍为 **18,179**。使用 `run_training.py`，没有把 val 合并进训练。
 
-A23、A27、A28 的半量基线和 A28 的 10 个独立改动，共 13 组训练＋FP32 测试入口，见 [半量实验配置与命令](DRIVOR_NAVTRAIN_HALF_ABLATIONS.md)。这些实验统一写入 `exp/navtrain_half_ablations/`。
+A23、A27、A28 的半量基线和 A28 的 12 个独立改动，共 15 组训练＋FP32 测试入口，见 [半量实验配置与命令](DRIVOR_NAVTRAIN_HALF_ABLATIONS.md)。这些实验统一写入 `exp/navtrain_half_ablations/`。
 
 只替换 scene-filter 的 `tokens`；原 `log_names`、train/val 日志名单、4 帧历史、10 帧可用未来、`frame_interval=1` 均保留。每条轨迹内部仍是 4 秒、2 Hz、8 点；减少的是训练场景起点。
 

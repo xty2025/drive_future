@@ -23,7 +23,7 @@ def sinusoidal_embedding_1d(dim, position):
     return torch.cat((angles.cos(), angles.sin()), dim=-1).to(position.dtype)
 
 
-def apply_rope(x, num_heads):
+def apply_rope(x, num_heads, *, offset=0):
     """Reference 1D RoPE; token positions restart for each candidate trajectory."""
     batch, length, width = x.shape
     head_dim = width // num_heads
@@ -31,7 +31,7 @@ def apply_rope(x, num_heads):
                                                          head_dim // 2, 2))
     freq = 1. / (10000 ** (torch.arange(0, head_dim, 2, device=x.device,
                                        dtype=torch.float64) / head_dim))
-    angles = torch.outer(torch.arange(length, device=x.device), freq)
+    angles = torch.outer(torch.arange(length, device=x.device) + offset, freq)
     rotations = torch.polar(torch.ones_like(angles), angles)[None, :, None]
     return torch.view_as_real(x_complex * rotations).reshape_as(x).to(x.dtype)
 
@@ -185,12 +185,12 @@ class ActionDiT(nn.Module):
                  len(loaded), len(own), 100 * self.load_report["fraction"], missing, skipped_text)
         return self.load_report
 
-    def load_wan_pretrained(self, path):
-        """Copy the native Wan 5B blocks/time weights, without interpolation.
+    def load_wan_pretrained(self, path, checkpoint_format='wan22_native'):
+        """Copy native Wan 2.1/2.2 blocks/time weights without interpolation.
 
         Video patch I/O and text embeddings do not represent trajectories or
         DINO features. Those adapters are new; all 30 full-width blocks load.
-        Read one tensor at a time, without materializing another 5B state dict.
+        Read one tensor at a time, supporting single-file and sharded releases.
         """
         import json
         from safetensors import safe_open
@@ -202,8 +202,13 @@ class ActionDiT(nn.Module):
                           ("num_layers", "num_layers")):
             if self.checkpoint_meta[name] != metadata[key]:
                 raise ValueError(f"Wan {key}={metadata[key]} differs from configured {name}")
-        index = json.loads((root / "diffusion_pytorch_model.safetensors.index.json").read_text())
-        weight_map = index["weight_map"]
+        index_path = root / "diffusion_pytorch_model.safetensors.index.json"
+        if index_path.is_file():
+            weight_map = json.loads(index_path.read_text())["weight_map"]
+        else:
+            filename = 'diffusion_pytorch_model.safetensors'
+            with safe_open(str(root / filename), framework='pt', device='cpu') as source:
+                weight_map = {key: filename for key in source.keys()}
         own = self.state_dict()
         wanted = {key for key in own if key.startswith(("blocks.", "time_embedding.", "time_projection."))}
         missing = sorted(wanted - weight_map.keys())
@@ -219,7 +224,7 @@ class ActionDiT(nn.Module):
                             raise ValueError(f"Wan tensor {key}: {tuple(tensor.shape)} != {tuple(own[key].shape)}")
                         own[key].copy_(tensor)
                         loaded_numel += tensor.numel()
-        self.load_report = dict(path=str(root.resolve()), format="wan22_native", metadata=metadata,
+        self.load_report = dict(path=str(root.resolve()), format=checkpoint_format, metadata=metadata,
             loaded_tensors=len(wanted), loaded_numel=loaded_numel,
             random_io_tensors=sorted(set(own) - wanted),
             omitted_source_tensors=sorted(set(weight_map) - wanted), interpolation=False)

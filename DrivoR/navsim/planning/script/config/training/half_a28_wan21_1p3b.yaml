@@ -1,0 +1,18 @@
+hydra:
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+
+defaults:
+  - half_training_defaults
+  - override /agent: drivoR_half_a28_wan21_1p3b
+  - _self_
+
+experiment_name: training_drivoR_half_a28_wan21_1p3b
+agent:
+  scheduler_args:
+    dataset_size: 42555
+# FP32 weights + explicit BF16 training forward, same FP32 epoch validation.
+trainer:
+  params:
+    strategy: deepspeed_stage_2
+    precision: 32-true

@@ -57,7 +57,7 @@ def tiny_agent(monkeypatch, variant, checkpoint='', scorer_heads=2):
     cfg.tf_d_model = 8; cfg.tf_d_ffn = 16; cfg.proposal_num = 4
     cfg.ref_num = 2; cfg.scorer_ref_num = 1; cfg.refiner_num_heads = scorer_heads
     cfg.pseudo_expert.path = '/absent/gt'
-    cfg.action_dit.update(dict(hidden_dim=16 if variant in ('a28_dit1024', 'a28_wan5b') else 8,
+    cfg.action_dit.update(dict(hidden_dim=16 if variant in ('a28_dit1024', 'a28_wan5b', 'a28_wan21_1p3b') else 8,
         ffn_dim=32, freq_dim=8, num_heads=2, attn_head_dim=4, num_layers=2,
         num_inference_steps=2, gradient_checkpointing=False))
     if variant != 'a28_random_dit':
@@ -67,6 +67,9 @@ def tiny_agent(monkeypatch, variant, checkpoint='', scorer_heads=2):
         cfg.future_register.rollouts_root = '/absent/videos'
         cfg.future_register.sensor_blobs_path = '/absent/sensors'
         cfg.future_register.teacher_batch_size = 8
+        if cfg.future_register.get('generator_kind') == 'mot':
+            cfg.future_register.mot.video_dit.update(dict(hidden_dim=16, ffn_dim=32, freq_dim=8,
+                num_heads=2, attn_head_dim=4, num_layers=2, pretrained_path=None, gradient_checkpointing=False))
     monkeypatch.setattr(base_module, 'DinoV3ImageEncoder', TinyEncoder)
     monkeypatch.setattr(vae_teacher, 'load_wan_vae', lambda options: TinyVae())
     result = get_class(raw._target_)(cfg, lr_args=dict(name='AdamW', base_lr=.001, base_batch_size=1),

@@ -70,8 +70,9 @@ class DrivoRActionDiTModel(nn.Module):
             attn_head_dim=action.attn_head_dim, num_layers=action.num_layers, eps=action.eps,
             use_gradient_checkpointing=action.gradient_checkpointing, context_dim=config.tf_d_model)
         if action.pretrained_path:
-            if action.get('pretrained_format', 'fastwam') == 'wan22_native':
-                self.action_dit.load_wan_pretrained(action.pretrained_path)
+            if action.get('pretrained_format', 'fastwam') in ('wan22_native', 'wan21_native'):
+                self.action_dit.load_wan_pretrained(action.pretrained_path,
+                    checkpoint_format=action.pretrained_format)
             else:
                 self.action_dit.load_pretrained(action.pretrained_path)
         self.schedule = ContinuousFlowSchedule(
