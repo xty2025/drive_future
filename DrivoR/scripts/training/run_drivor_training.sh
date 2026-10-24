@@ -131,7 +131,18 @@ fi
 # YAML 中的 weights/... 相对于 DrivoR 根目录解析。
 cd -- "${DRIVOR_ROOT}"
 
-exec "${DRIVOR_LAUNCH[@]}" "${NAVSIM_DEVKIT_ROOT}/navsim/planning/script/run_training.py" \
+DRIVOR_TRAINING_ENTRY="${DRIVOR_TRAINING_ENTRY:-run_training.py}"
+case "${DRIVOR_TRAINING_ENTRY}" in
+    run_training.py|run_training_full.py) ;;
+    *) printf 'Unknown training entry: %s\n' "${DRIVOR_TRAINING_ENTRY}" >&2; exit 2 ;;
+esac
+DRIVOR_TRAINING_CONFIG_ARGS=()
+if [[ -n "${DRIVOR_TRAINING_CONFIG:-}" ]]; then
+    DRIVOR_TRAINING_CONFIG_ARGS+=("--config-name=${DRIVOR_TRAINING_CONFIG}")
+fi
+
+exec "${DRIVOR_LAUNCH[@]}" "${NAVSIM_DEVKIT_ROOT}/navsim/planning/script/${DRIVOR_TRAINING_ENTRY}" \
+    "${DRIVOR_TRAINING_CONFIG_ARGS[@]}" \
     agent=drivoR \
     "experiment_name=${DRIVOR_EXPERIMENT}" \
     "experiment_uid=${DRIVOR_RUN_ID}" \

@@ -136,6 +136,136 @@ MODELS = {
         "bank_seed2_train_eval_run1/lightning_logs/version_0" / CKPT,
         eval_dir=EXP / "eval_navtest_action_dit_dinov3_vitl_multigt_bank"),
 }
+def _summary_exp(family, variant, color, agent, train, eval_run, extra=()):
+    """Experiment of exp/ke/EXPERIMENT_RESULTS_SUMMARY.md, evaluated in FP32 with these overrides on last.ckpt."""
+    return dict(family=family, variant=variant, color=color, bf16=False,
+                overrides=[f"agent={agent}", "agent.config.multi_gt.enabled=false", *extra],
+                checkpoint=EXP / train / "lightning_logs/version_0/checkpoints/last.ckpt", eval_dir=EXP / eval_run)
+
+
+QUERY = ["agent.config.long_trajectory_additional_poses=0"]
+QUERY_REGISTER = QUERY + ["agent.config.future_register.init_checkpoint=null"]
+ACTION_REGISTER = ["agent.config.future_register.init_checkpoint=null", "agent.config.action_dit.pretrained_path=null",
+                   "agent.config.visual_feature_mode=native_patches", "agent.config.num_scene_tokens=0",
+                   "agent.config.future_register.scorer.fusion=project"]
+_T01 = ("drivoR_query_register_dinov3_vitl_single_gt",
+        "training_drivoR_query_register_dinov3_vitl_navtrain_single_gt/query_register_single_gt_seed2_dlc1stkt1n8i1ctp_20261021_run1",
+        "eval_navtest_query_register_dinov3_vitl_single_gt/query_register_single_gt_seed2_dlc1stkt1n8i1ctp_20261021_run1",
+        QUERY_REGISTER)
+_T08 = ("drivoR_query_dinov3_vitl_human_diverse8_l1_register",
+        "training_drivoR_query_dinov3_vitl_navtrain_human_diverse8_l1_register/query_human_diverse8_l1_register_seed2_"
+        "dlc1stkt1n8i1ctp_20261022_210127",
+        "eval_navtest_query_dinov3_vitl_human_diverse8_l1_register/query_human_diverse8_l1_register_seed2_dlc1stkt1n8i1ctp_"
+        "20261022_210127", QUERY_REGISTER)
+# Conclusion 4 compares pairs; family = the factor that changes within a pair, dark/light = the two members.
+# T01 and T08 appear in both plain-Transformer comparisons, once per role.
+MODELS.update({
+    # Register into the scorer (register alignment on in both): plain Transformer T01/T03, T02/T04, T08/T09.
+    "fusion_T01": _summary_exp("orig scorer", "T01 H", "#256abf", *_T01),
+    "fusion_T03": _summary_exp(
+        "reg scorer", "T03 H", "#86b6ef", "drivoR_query_register_dinov3_vitl_scorer_single_gt",
+        "training_drivoR_query_register_dinov3_vitl_navtrain_scorer_single_gt/query_register_scorer_single_gt_seed2_"
+        "dlc1stkt1n8i1ctp_20261021_run1",
+        "eval_navtest_query_register_dinov3_vitl_scorer_single_gt/query_register_scorer_single_gt_seed2_dlc1stkt1n8i1ctp_"
+        "20261021_run1", QUERY_REGISTER),
+    "fusion_T02": _summary_exp(
+        "orig scorer", "T02 M4", "#4a3aa7", "drivoR_query_register_dinov3_vitl_multigt",
+        "training_drivoR_query_register_dinov3_vitl_navtrain_multigt/query_register_multigt_seed2_dlcudc5qjukb34ak_"
+        "20261021_run1",
+        "eval_navtest_query_register_dinov3_vitl_multigt/query_register_multigt_seed2_dlcudc5qjukb34ak_20261021_run1",
+        QUERY_REGISTER),
+    "fusion_T04": _summary_exp(
+        "reg scorer", "T04 M4", "#9d92d8", "drivoR_query_register_dinov3_vitl_scorer_multigt",
+        "training_drivoR_query_register_dinov3_vitl_navtrain_scorer_multigt/query_register_scorer_multigt_seed2_"
+        "dlcudc5qjukb34ak_20261021_run1",
+        "eval_navtest_query_register_dinov3_vitl_scorer_multigt/query_register_scorer_multigt_seed2_dlcudc5qjukb34ak_"
+        "20261021_run1", QUERY_REGISTER),
+    "fusion_T08": _summary_exp("orig scorer", "T08 H+D8", "#52514e", *_T08),
+    "fusion_T09": _summary_exp(
+        "reg scorer", "T09 H+D8", "#b4b3ac", "drivoR_query_dinov3_vitl_human_diverse8_l1_register_scorer",
+        "training_drivoR_query_dinov3_vitl_navtrain_human_diverse8_l1_register_scorer/query_human_diverse8_l1_register_"
+        "scorer_seed2_dlcudc5qjukb34ak_20261022_210127",
+        "eval_navtest_query_dinov3_vitl_human_diverse8_l1_register_scorer/query_human_diverse8_l1_register_scorer_seed2_"
+        "dlcudc5qjukb34ak_20261022_210127", QUERY_REGISTER),
+    # Register into the scorer, Action-DiT DINOv3-L: A14/A15 (M4), A18/A19 (M4 + PE8 vMSE).
+    "fusion_A14": _summary_exp(
+        "orig scorer", "A14 M4", "#256abf", "drivoR_action_dit_dinov3_vitl_register",
+        "training_drivoR_action_dit_dinov3_vitl_navtrain_register/dinov3_register_seed2_run1",
+        "eval_navtest_action_dit_dinov3_vitl_register/dinov3_register_seed2_run1", ACTION_REGISTER),
+    "fusion_A15": _summary_exp(
+        "reg scorer", "A15 M4", "#86b6ef", "drivoR_action_dit_dinov3_vitl_register_scorer",
+        "training_drivoR_action_dit_dinov3_vitl_navtrain_register_scorer/dinov3_register_scorer_seed2_run1",
+        "eval_navtest_action_dit_dinov3_vitl_register_scorer/dinov3_register_scorer_seed2_run1", ACTION_REGISTER),
+    "fusion_A18": _summary_exp(
+        "orig scorer", "A18 M4+PE8", "#4a3aa7", "drivoR_action_dit_dinov3_vitl_register",
+        "training_drivoR_action_dit_dinov3_vitl_navtrain_multigt_pseudo_expert_vmse_register/action_dit_pe_vmse_register_"
+        "seed2_train_eval_run1",
+        "eval_navtest_action_dit_dinov3_vitl_pseudo_expert_vmse_register/action_dit_pe_vmse_register_seed2_train_eval_run1",
+        ACTION_REGISTER),
+    "fusion_A19": _summary_exp(
+        "reg scorer", "A19 M4+PE8", "#9d92d8", "drivoR_action_dit_dinov3_vitl_register_scorer",
+        "training_drivoR_action_dit_dinov3_vitl_navtrain_multigt_pseudo_expert_vmse_register_scorer/action_dit_pe_vmse_"
+        "register_scorer_seed2_train_eval_run1",
+        "eval_navtest_action_dit_dinov3_vitl_pseudo_expert_vmse_register_scorer/action_dit_pe_vmse_register_scorer_seed2_"
+        "train_eval_run1", ACTION_REGISTER),
+    # Register alignment itself, original scorer: plain Transformer T10/T01 (H), T05/T06 (H + HL), T07/T08 (H + D8).
+    "align_T10": _summary_exp(
+        "no register", "T10 H", "#256abf", "drivoR_query_dinov3_vitl_single_gt",
+        "training_drivoR_query_dinov3_vitl_navtrain_single_gt/query_dinov3_vitl_single_gt_seed2_20261022_221845",
+        "eval_navtest_query_dinov3_vitl_single_gt/query_dinov3_vitl_single_gt_seed2_20261022_221845", QUERY),
+    "align_T01": _summary_exp("+register align", "T01 H", "#86b6ef", *_T01),
+    "align_T05": _summary_exp(
+        "no register", "T05 H+HL", "#4a3aa7", "drivoR_query_dinov3_vitl_single_gt_long",
+        "training_drivoR_query_dinov3_vitl_navtrain_single_gt_long/query_dinov3_vitl_single_gt_long_seed2_"
+        "dlc8hwmx72tdbjoc_chain1",
+        "eval_navtest_query_dinov3_vitl_single_gt_long/query_dinov3_vitl_single_gt_long_seed2_dlc8hwmx72tdbjoc_chain1",
+        QUERY),
+    "align_T06": _summary_exp(
+        "+register align", "T06 H+HL", "#9d92d8", "drivoR_query_dinov3_vitl_single_gt_long_register",
+        "training_drivoR_query_dinov3_vitl_navtrain_single_gt_long_register/query_dinov3_vitl_single_gt_long_register_"
+        "seed2_dlc1stkt1n8i1ctp_chain1",
+        "eval_navtest_query_dinov3_vitl_single_gt_long_register/query_dinov3_vitl_single_gt_long_register_seed2_"
+        "dlc1stkt1n8i1ctp_chain1", QUERY),
+    "align_T07": _summary_exp(
+        "no register", "T07 H+D8", "#52514e", "drivoR_query_dinov3_vitl_human_diverse8_l1",
+        "training_drivoR_query_dinov3_vitl_navtrain_human_diverse8_l1/query_dinov3_vitl_human_diverse8_l1_seed2_"
+        "dlcudc5qjukb34ak_chain1",
+        "eval_navtest_query_dinov3_vitl_human_diverse8_l1/query_dinov3_vitl_human_diverse8_l1_seed2_dlcudc5qjukb34ak_chain1",
+        QUERY),
+    "align_T08": _summary_exp("+register align", "T08 H+D8", "#b4b3ac", *_T08),
+})
+# Action-DiT DINOv3-L with human X-L1: A24 H+HL, A23 H+D8, A27 H+D8 + register alignment, A28 + register scorer.
+# A23/A24 were evaluated with the plain DINOv3 Action-DiT agent, A27/A28 with their diverse8 register agents.
+DINOV3_EVAL = ["agent.config.action_dit.pretrained_path=null", "agent.config.action_dit.num_inference_steps=10",
+               "agent.config.visual_feature_mode=native_patches", "agent.config.num_scene_tokens=0"]
+MODELS.update({
+    "xl1_A24": _summary_exp(
+        "no register", "A24 H+HL", "#b4b3ac", "drivoR_action_dit_dinov3_vitl",
+        "training_drivoR_action_dit_dinov3_vitl_navtrain_single_gt_long_xl1/action_dit_dinov3_vitl_single_gt_long_xl1_"
+        "seed2_dlc16mhamjyg8qtw_20261021_run1",
+        "eval_navtest_action_dit_dinov3_vitl_single_gt_long_xl1/action_dit_dinov3_vitl_single_gt_long_xl1_seed2_"
+        "dlc16mhamjyg8qtw_20261021_run1", DINOV3_EVAL),
+    "xl1_A23": _summary_exp(
+        "no register", "A23 H+D8", "#52514e", "drivoR_action_dit_dinov3_vitl",
+        "training_drivoR_action_dit_dinov3_vitl_navtrain_human_xl1_diverse8_l1/action_dit_dinov3_vitl_human_xl1_diverse8_"
+        "l1_seed2_dlc112peyzbocg66_20261021_run1",
+        "eval_navtest_action_dit_dinov3_vitl_human_xl1_diverse8_l1/action_dit_dinov3_vitl_human_xl1_diverse8_l1_seed2_"
+        "dlc112peyzbocg66_20261021_run1", DINOV3_EVAL),
+    "xl1_A27": _summary_exp(
+        "+register", "A27 H+D8 align", "#4a3aa7", "drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register",
+        "training_drivoR_action_dit_dinov3_vitl_navtrain_human_xl1_diverse8_l1_register/action_dit_human_xl1_diverse8_l1_"
+        "register_seed2_dlc16mhamjyg8qtw_20261022_210127",
+        "eval_navtest_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register/action_dit_human_xl1_diverse8_l1_register_"
+        "seed2_dlc16mhamjyg8qtw_20261022_210127", QUERY_REGISTER),
+    "xl1_A28": _summary_exp(
+        "+register", "A28 H+D8 reg scorer", "#9d92d8", "drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer",
+        "training_drivoR_action_dit_dinov3_vitl_navtrain_human_xl1_diverse8_l1_register_scorer/action_dit_human_xl1_"
+        "diverse8_l1_register_scorer_seed2_20261022_210127",
+        "eval_navtest_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer/action_dit_human_xl1_diverse8_l1_"
+        "register_scorer_seed2_20261022_210127", QUERY_REGISTER),
+})
+
+
 GROUP_ORDER = ("ref_better", "other_better", "disagree", "scorer_miss", "low_coverage", "all_good")
 STAT_KEYS = ("selected_true", "selected_pred", "best_true", "num_good", "spread_lat_m", "spread_long_m", "min_ade_m")
 

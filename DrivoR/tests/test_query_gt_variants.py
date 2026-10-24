@@ -13,13 +13,13 @@ from test_action_dit_register import TinyEncoder, sample, oracle
 
 
 ROOT=Path(__file__).resolve().parents[1]
-VARIANTS=('single_gt_long','single_gt_long_register','human_diverse8_l1')
+VARIANTS=('single_gt_long','single_gt_long_register','human_diverse8_l1','single_gt')
 
 
 def config(variant):
     folder=ROOT/'navsim/planning/script/config/common/agent'
     names=['drivoR','drivoR_query_register_dinov3_vitl','drivoR_query_dinov3_vitl']
-    if variant=='single_gt_long_register':
+    if variant in ('single_gt_long_register','single_gt'):
         names.append('drivoR_query_dinov3_vitl_single_gt_long')
     names.append('drivoR_query_dinov3_vitl_'+variant)
     cfg=OmegaConf.merge(*[OmegaConf.load(folder/(name+'.yaml')).config for name in names])
@@ -55,10 +55,11 @@ def test_shared_parameters_have_identical_initialization_and_action_path(monkeyp
     for variant in VARIANTS:
         torch.manual_seed(51)
         models.append(agent(monkeypatch,variant)._drivor_model.eval())
-    baseline,with_future,diverse=models
+    baseline,with_future,diverse,human_only=models
     for key,tensor in baseline.state_dict().items():
         assert torch.equal(tensor,with_future.state_dict()[key]),key
         assert torch.equal(tensor,diverse.state_dict()[key]),key
+        assert torch.equal(tensor,human_only.state_dict()[key]),key
     assert baseline.query_decoder.attention_mask.shape==(4,4)
     assert with_future.query_decoder.attention_mask.shape==(132,132)
     assert not hasattr(baseline,'future_queries') and not hasattr(diverse,'ema_teacher')
@@ -67,13 +68,15 @@ def test_shared_parameters_have_identical_initialization_and_action_path(monkeyp
         with_future.future_queries.add_(10)
         extended=with_future(sample[0])
         extra=diverse(sample[0])
+        human=human_only(sample[0])
     for key in ('proposals','pdm_score'):
         torch.testing.assert_close(original[key],extended[key],atol=1e-6,rtol=1e-5)
         torch.testing.assert_close(original[key],extra[key],atol=0,rtol=0)
+        torch.testing.assert_close(original[key],human[key],atol=0,rtol=0)
     assert 'predicted_registers' not in original and 'predicted_registers' not in extra
 
 
-@pytest.mark.parametrize('variant',['single_gt_long','human_diverse8_l1'])
+@pytest.mark.parametrize('variant',['single_gt','single_gt_long','human_diverse8_l1'])
 def test_no_register_models_construct_no_teacher_and_load_no_future_rgb(monkeypatch,sample,tmp_path,variant):
     def forbidden(*args,**kwargs):
         raise AssertionError('No future branch or target builder should be constructed')
@@ -91,6 +94,30 @@ def test_no_register_models_construct_no_teacher_and_load_no_future_rgb(monkeypa
     assert torch.isfinite(loss['loss'])
     prefixes=('future_queries','future_time_embedding','register_slot_embedding','register_head','ema_teacher')
     assert not any(key.startswith(prefixes) for key in value._drivor_model.state_dict())
+
+
+def test_single_human_only_supervises_its_winner_without_long_gt(monkeypatch):
+    model=agent(monkeypatch,'single_gt')._drivor_model
+    poses=torch.zeros(1,4,8,3)
+    poses[:,1]=10;poses[:,2]=20;poses[:,3]=30
+    poses.requires_grad_()
+    human=torch.full((1,8,3),.2)
+    output=dict(proposals=poses)
+    model._add_supervision(output,dict(trajectory=human))
+    torch.testing.assert_close(output['_trajectory_loss'],torch.tensor(.6))
+    assert output['_human_matched_indices'].tolist()==[[0]]
+    assert output['_register_loss']==0
+    assert '_long_matched_indices' not in output
+    assert set(output['_query_diagnostics'])=={'human_trajectory_loss'}
+    # A stale target cache must not silently re-enable long/auxiliary GT loss.
+    extras=dict(proposals=poses)
+    model._add_supervision(extras,dict(trajectory=human,
+        trajectory_long=torch.full_like(human,10.3),
+        pseudo_experts=torch.full((1,8,8,3),20.3),
+        pseudo_expert_mask=torch.ones(1,8,dtype=torch.bool)))
+    torch.testing.assert_close(extras['_trajectory_loss'],output['_trajectory_loss'])
+    output['_trajectory_loss'].backward()
+    assert (poses.grad.abs().sum((-2,-1))>0).tolist()==[[True,False,False,False]]
 
 
 def test_long_and_human_share_proposals_but_only_human_winner_gets_future_loss(monkeypatch):

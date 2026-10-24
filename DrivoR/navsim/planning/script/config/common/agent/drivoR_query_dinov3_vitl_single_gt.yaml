@@ -1,0 +1,8 @@
+defaults:
+  - drivoR_query_dinov3_vitl_single_gt_long
+  - _self_
+
+# T05 control: same network and 64 proposals, only the original human GT.
+# Physical best-of-64 L1 + the original Scorer loss; no long/future targets.
+config:
+  long_trajectory_additional_poses: 0

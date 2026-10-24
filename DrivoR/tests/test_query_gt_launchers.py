@@ -1,4 +1,4 @@
-"""All three GT controls preserve architecture through automatic FP32 navtest."""
+"""GT controls preserve architecture through automatic FP32 navtest."""
 
 import json
 import os
@@ -12,7 +12,7 @@ import pytest
 ROOT=Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('variant',['single_gt_long','single_gt_long_register','human_diverse8_l1'])
+@pytest.mark.parametrize('variant',['single_gt','single_gt_long','single_gt_long_register','human_diverse8_l1'])
 @pytest.mark.parametrize('rank,args,exit_code',[(0,[],0),(7,[],0),(0,['--cfg','job'],0),(0,[],7),
     (0,['agent.config.ref_num=6','agent.config.future_register.enabled=false'],0)])
 def test_pipeline(tmp_path,variant,rank,args,exit_code):

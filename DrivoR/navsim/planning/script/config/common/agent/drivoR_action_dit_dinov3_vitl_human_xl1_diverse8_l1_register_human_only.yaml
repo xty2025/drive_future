@@ -1,0 +1,11 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register
+  - _self_
+
+# A27 control: keep H + 0.5*D8 trajectory L1; only H supervises future registers.
+config:
+  future_register:
+    supervision_scope: human_only
+    frames_root: null
+    rollouts_root: null
+    build_missing_cache: false

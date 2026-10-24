@@ -215,14 +215,21 @@ def model_forward(agent, features, tokens, noise_seed, bf16=None):
         with autocast:
             return agent.forward(features)
     noise = flow_noise(tokens, (model.proposal_num, model.poses_num, 3), noise_seed).to(device)
-    sample = model.sample_normalized
-    # forward() calls self.sample_normalized(scene, ego); this instance attribute passes it the fixed noise.
-    model.sample_normalized = lambda scene, ego: sample(scene, ego, noise=noise)
+    # forward() calls self.sample_normalized(scene, ego), or self.sample_joint(scene, ego) when the model denoises
+    # future registers with the trajectories; an instance attribute passes it the fixed noise.
+    name = "sample_joint" if hasattr(model, "sample_joint") else "sample_normalized"
+    sample = getattr(model, name)
+    if name == "sample_joint":
+        registers = flow_noise(tokens, (model.proposal_num, model.register_count, model.register_dim),
+                               f"{noise_seed}/registers").to(device)
+        model.sample_joint = lambda scene, ego: sample(scene, ego, action_noise=noise, register_noise=registers)
+    else:
+        model.sample_normalized = lambda scene, ego: sample(scene, ego, noise=noise)
     try:
         with autocast:
             return agent.forward(features)
     finally:
-        del model.sample_normalized
+        delattr(model, name)
 
 
 def drivor_scene_context(model, features):

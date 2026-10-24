@@ -1,0 +1,10 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer
+  - _self_
+
+# Independent ablation: inherit A28 directly, never another ablation.
+config:
+  action_dit:
+    hidden_dim: 1024
+    ffn_dim: 4096
+    pretrained_path: /cpfs29jb/data/zhaozc/project/FastWam_re/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim_3outdim.pt

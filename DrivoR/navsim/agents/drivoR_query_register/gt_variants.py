@@ -32,8 +32,6 @@ class DrivoRQueryGTModel(DrivoRQueryRegisterModel):
             raise ValueError('Use current ego/cameras and one Action query per trajectory')
         if any(config[key] for key in ('double_score', 'agent_pred', 'area_pred', 'bev_map', 'bev_agent')):
             raise ValueError('Use the standard six-head trajectory Scorer')
-        if config.future_register.scorer.enabled:
-            raise ValueError('All three controls use the original trajectory-only Scorer')
         cameras = [list(config[name]) for name in
             ('cam_f0','cam_l0','cam_l1','cam_l2','cam_r0','cam_r1','cam_r2','cam_b0') if len(config[name])]
         if not cameras or any(indices != [3] for indices in cameras):
@@ -43,7 +41,9 @@ class DrivoRQueryGTModel(DrivoRQueryRegisterModel):
         if self.use_diverse8 and (auxiliary.source != 'diverse8' or auxiliary.loss_type != 'l1'):
             raise ValueError('The additional GT source must be diverse8 with physical L1 coverage')
         self.predict_future = bool(config.future_register.enabled)
-        self.use_register_scorer = False
+        self.use_register_scorer = bool(config.future_register.scorer.enabled)
+        if self.use_register_scorer and not self.predict_future:
+            raise ValueError('Register Scorer requires future register prediction')
         self.future_stage = 'joint'
         self.num_cams = len(cameras)
         self.proposal_num, self.poses_num = int(config.proposal_num), int(config.num_poses)
@@ -71,6 +71,13 @@ class DrivoRQueryGTModel(DrivoRQueryRegisterModel):
             self.register_head = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, self.register_dim))
             self.ema_teacher = EmaDinoRegisters(self.image_backbone.native_vit,
                 decay=config.future_register.ema_decay, chunk_size=config.future_register.teacher_batch_size)
+        if self.use_register_scorer:
+            if config.future_register.scorer.fusion != 'project':
+                raise ValueError('Register Scorer uses compression, concatenation, then MLP')
+            self.register_score_projection = nn.Sequential(
+                nn.Linear(self.register_count * self.register_dim, width), nn.ReLU())
+            self.score_fusion = nn.Sequential(nn.Linear(2 * width, config.tf_d_ffn),
+                                             nn.ReLU(), nn.Linear(config.tf_d_ffn, width))
 
     def make_queries(self, ego):
         if self.predict_future:

@@ -119,7 +119,7 @@ class ActionBlock(nn.Module):
 class ActionDiT(nn.Module):
     def __init__(self, hidden_dim=256, action_dim=3, ffn_dim=1024, freq_dim=256,
                  num_heads=24, attn_head_dim=128, num_layers=30, eps=1e-6,
-                 use_gradient_checkpointing=True):
+                 use_gradient_checkpointing=True, context_dim=None):
         super().__init__()
         if attn_head_dim % 2 or freq_dim % 2:
             raise ValueError("RoPE head width and sinusoidal width must be even")
@@ -138,6 +138,13 @@ class ActionDiT(nn.Module):
         # The reference ActionDiT actually uses this plain Linear head; its
         # separate ActionHead class is unused by the requested configuration.
         self.head = nn.Linear(hidden_dim, action_dim)
+        # Keep DrivoR perception/Scorer at 256 even for a wider trajectory DiT.
+        # Identities add no state-dict keys to the existing 256-wide models.
+        context_dim = hidden_dim if context_dim is None else int(context_dim)
+        self.scene_projection = (nn.Identity() if context_dim == hidden_dim
+                                 else nn.Linear(context_dim, hidden_dim))
+        self.ego_projection = (nn.Identity() if context_dim == hidden_dim
+                               else nn.Linear(context_dim, hidden_dim))
         self.load_report = None
 
     def load_pretrained(self, path):
@@ -160,7 +167,8 @@ class ActionDiT(nn.Module):
         loaded = {name: value for name, value in state.items() if name not in skipped_text}
         unexpected = sorted(set(loaded) - set(own))
         missing = sorted(set(own) - set(loaded))
-        missing_backbone = [name for name in missing if not name.startswith(("action_encoder.", "head."))]
+        missing_backbone = [name for name in missing if not name.startswith(
+            ("action_encoder.", "head.", "scene_projection.", "ego_projection."))]
         bad_shapes = [name for name in loaded if name in own and loaded[name].shape != own[name].shape]
         if unexpected or missing_backbone or bad_shapes:
             raise ValueError(f"ActionDiT checkpoint mismatch: unexpected={unexpected}, "
@@ -177,7 +185,51 @@ class ActionDiT(nn.Module):
                  len(loaded), len(own), 100 * self.load_report["fraction"], missing, skipped_text)
         return self.load_report
 
+    def load_wan_pretrained(self, path):
+        """Copy the native Wan 5B blocks/time weights, without interpolation.
+
+        Video patch I/O and text embeddings do not represent trajectories or
+        DINO features. Those adapters are new; all 30 full-width blocks load.
+        Read one tensor at a time, without materializing another 5B state dict.
+        """
+        import json
+        from safetensors import safe_open
+
+        root = Path(path)
+        metadata = json.loads((root / "config.json").read_text())
+        for name, key in (("hidden_dim", "dim"), ("ffn_dim", "ffn_dim"),
+                          ("freq_dim", "freq_dim"), ("num_heads", "num_heads"),
+                          ("num_layers", "num_layers")):
+            if self.checkpoint_meta[name] != metadata[key]:
+                raise ValueError(f"Wan {key}={metadata[key]} differs from configured {name}")
+        index = json.loads((root / "diffusion_pytorch_model.safetensors.index.json").read_text())
+        weight_map = index["weight_map"]
+        own = self.state_dict()
+        wanted = {key for key in own if key.startswith(("blocks.", "time_embedding.", "time_projection."))}
+        missing = sorted(wanted - weight_map.keys())
+        if missing:
+            raise ValueError(f"Missing Wan backbone tensors: {missing}")
+        loaded_numel = 0
+        with torch.no_grad():
+            for filename in sorted({weight_map[key] for key in wanted}):
+                with safe_open(str(root / filename), framework="pt", device="cpu") as source:
+                    for key in sorted(k for k in wanted if weight_map[k] == filename):
+                        tensor = source.get_tensor(key)
+                        if tensor.shape != own[key].shape:
+                            raise ValueError(f"Wan tensor {key}: {tuple(tensor.shape)} != {tuple(own[key].shape)}")
+                        own[key].copy_(tensor)
+                        loaded_numel += tensor.numel()
+        self.load_report = dict(path=str(root.resolve()), format="wan22_native", metadata=metadata,
+            loaded_tensors=len(wanted), loaded_numel=loaded_numel,
+            random_io_tensors=sorted(set(own) - wanted),
+            omitted_source_tensors=sorted(set(weight_map) - wanted), interpolation=False)
+        log.info("Native Wan: loaded %d tensors / %d parameters; new trajectory/DINO adapters",
+                 len(wanted), loaded_numel)
+        return self.load_report
+
     def forward(self, noisy_action, timesteps, scene_context, ego_embedding):
+        scene_context = self.scene_projection(scene_context)
+        ego_embedding = self.ego_projection(ego_embedding)
         b, m, _, _ = noisy_action.shape
         time = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim,
                                                            timesteps.float().reshape(-1)))

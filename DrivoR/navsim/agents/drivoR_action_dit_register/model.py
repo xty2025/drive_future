@@ -9,7 +9,7 @@ from navsim.agents.drivoR_action_dit.model import DrivoRActionDiTModel
 
 from .dit import ActionRegisterDiT
 from .losses import assigned_register_loss, matched_register_loss
-from .teacher import EmaDinoRegisters
+from .teacher import build_future_teacher
 
 
 class DrivoRActionRegisterModel(DrivoRActionDiTModel):
@@ -22,21 +22,22 @@ class DrivoRActionRegisterModel(DrivoRActionDiTModel):
         if self.future_stage not in ('joint','future_only'):
             raise ValueError('future_register.stage must be joint or future_only')
         self.register_frames = 8
-        self.registers_per_frame = 4
-        self.register_dim = self.image_backbone.num_features
-        self.register_count = self.register_frames*self.registers_per_frame
         self.register_loss_type = str(options.loss_type)
         self.use_register_scorer = bool(options.scorer.enabled)
         self.register_fusion = str(options.scorer.fusion)
         if config.multi_gt.get('input_gt_assignment','original') != 'original':
             raise ValueError('These register variants keep original-human Action and future-register noise anchors')
-        experts = config.get('pseudo_expert', {})
-        if experts.get('enabled', False) and experts.get('loss_type') != 'velocity':
-            raise ValueError('Register pseudo-experts use pseudo_expert.loss_type=velocity')
-        self.ema_teacher = EmaDinoRegisters(self.image_backbone.native_vit,
-                                           decay=options.ema_decay,chunk_size=options.teacher_batch_size)
+        self._validate_auxiliary_config(config)
+        if options.get('freeze_current_vit', False):
+            self.image_backbone.native_vit.requires_grad_(False)
+        self.ema_teacher = build_future_teacher(self.image_backbone.native_vit, options)
+        self.registers_per_frame = self.ema_teacher.register_count
+        self.register_dim = self.ema_teacher.dim
+        self.register_count = self.register_frames*self.registers_per_frame
         self.action_dit = ActionRegisterDiT(self.action_dit,self.register_dim,self.poses_num,
-                                            self.register_frames,self.registers_per_frame)
+            self.register_frames,self.registers_per_frame,
+            token_order=options.get('token_order', 'action_first'),
+            attention_mode=options.get('attention_mode', 'register_reads_action'))
         if self.use_register_scorer:
             width = self.register_count*self.register_dim
             if self.register_fusion == 'flatten':
@@ -56,6 +57,11 @@ class DrivoRActionRegisterModel(DrivoRActionDiTModel):
                 module = getattr(self,name,None)
                 if module is not None:
                     module.requires_grad_(False)
+
+    def _validate_auxiliary_config(self, config):
+        experts = config.get('pseudo_expert', {})
+        if experts.get('enabled', False) and experts.get('loss_type') != 'velocity':
+            raise ValueError('Register pseudo-experts use pseudo_expert.loss_type=velocity')
 
     def score_proposals(self, proposals, scene, ego, predicted_registers=None):
         if not self.use_register_scorer:

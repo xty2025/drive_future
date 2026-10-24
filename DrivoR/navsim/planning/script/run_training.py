@@ -59,6 +59,16 @@ def resolve_train_checkpoint(output_dir, explicit_path=None, auto_resume: bool =
     return str(max(checkpoints, key=lambda path: (path.stat().st_mtime_ns, str(path))))
 
 
+def sync_scheduler_dataset_size(cfg, agent, dataset):
+    """Opt-in for full training; keep existing train-only schedules unchanged."""
+    if not cfg.get('runtime', {}).get('scheduler_dataset_size_from_data', False):
+        return
+    if getattr(agent, 'scheduler_args', None) is not None:
+        agent.scheduler_args.dataset_size = len(dataset)
+        cfg.agent.scheduler_args.dataset_size = len(dataset)
+        logger.info('Scheduler dataset_size set from actual training data: %d', len(dataset))
+
+
 
 def build_datasets(cfg: DictConfig, agent: AbstractAgent) -> Tuple[Dataset, Dataset]:
     """
@@ -180,6 +190,15 @@ def main(cfg: DictConfig) -> None:
     logger.info("Num training samples: %d", len(train_data))
     val_dataloader = build_dataloader(val_data, cfg.dataloader.params, shuffle=False, seed=cfg.seed + 1)
     logger.info("Num validation samples: %d", len(val_data))
+
+    sync_scheduler_dataset_size(cfg, agent, train_data)
+    if cfg.get('runtime', {}).get('training_data_scope') == 'trainval' and int(os.environ.get('RANK', '0')) == 0:
+        import json
+        (Path(cfg.output_dir)/'trainval_full_dataset.json').write_text(json.dumps({
+            'train_samples': len(train_data), 'validation_samples': len(val_data),
+            'validation_is_training_subset': True,
+            'scheduler_dataset_size': getattr(getattr(agent, 'scheduler_args', None), 'dataset_size', None),
+        }, indent=2)+'\n')
 
     logger.info("Building Trainer")
     trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks())

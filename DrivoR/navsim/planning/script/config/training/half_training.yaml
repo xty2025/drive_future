@@ -1,0 +1,23 @@
+hydra:
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+
+defaults:
+  - training_runtime_defaults
+  - override /train_test_split: navtrain_half
+  - _self_
+
+# Run with run_training.py: 42,555 train scenes and the original 18,179 val.
+# Cache-only training ignores scene_filter.tokens, so it must stay disabled.
+cache_path: null
+use_cache_without_dataset: false
+experiment_name: training_drivoR_navtrain_half
+auto_resume: false
+seed: 2
+
+runtime:
+  scheduler_dataset_size_from_data: true
+
+agent:
+  scheduler_args:
+    dataset_size: 42555

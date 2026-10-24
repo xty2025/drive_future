@@ -1,0 +1,14 @@
+hydra:
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+
+defaults:
+  - half_training_defaults
+  - override /agent: drivoR_half_a28_frozen_vit
+  - _self_
+
+experiment_name: training_drivoR_half_a28_frozen_vit
+# Keep the 42,555 selected train scenes and the entire original val split.
+agent:
+  scheduler_args:
+    dataset_size: 42555

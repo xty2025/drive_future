@@ -4,6 +4,14 @@ from navsim.planning.training.agent_lightning_module import AgentLightningModule
 
 
 class RegisterLightningModule(AgentLightningModule):
+    def optimizer_step(self, *args, **kwargs):
+        result = super().optimizer_step(*args, **kwargs)
+        # ZeRO copies/all-gathers updated parameters after its inner optimizer
+        # step. Update EMA only after the outer engine step has completed.
+        if self.agent._config.get('action_dit', {}).get('ema_after_lightning_step', False):
+            self.agent._after_optimizer_step(None, (), {})
+        return result
+
     def on_save_checkpoint(self, checkpoint):
         checkpoint['future_register_stage'] = self.agent._drivor_model.future_stage
 

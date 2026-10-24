@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DRIVOR_QUERY_GT_VARIANT="${1:?Specify single_gt_long, single_gt_long_register or human_diverse8_l1}"
+DRIVOR_QUERY_GT_VARIANT="${1:?Specify single_gt, single_gt_long, single_gt_long_register or human_diverse8_l1}"
 shift
 case "${DRIVOR_QUERY_GT_VARIANT}" in
     single_gt_long|single_gt_long_register) DRIVOR_QUERY_LONG_POSES=2 ;;
-    human_diverse8_l1) DRIVOR_QUERY_LONG_POSES=0 ;;
+    single_gt|human_diverse8_l1) DRIVOR_QUERY_LONG_POSES=0 ;;
     *) printf 'Unknown query GT variant: %s\n' "${DRIVOR_QUERY_GT_VARIANT}" >&2; exit 2 ;;
 esac
 DRIVOR_QUERY_GT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

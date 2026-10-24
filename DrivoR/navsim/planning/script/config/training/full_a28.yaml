@@ -1,0 +1,14 @@
+hydra:
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+
+defaults:
+  - training_full_defaults
+  - override /agent: drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer
+  - _self_
+
+# Original A28: same H + D8 objectives, detached predicted registers in Scorer.
+# The main D8 root includes the hist3 scene symlinks; keep the shared RGB cache.
+experiment_name: training_drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer_trainval_full
+full_training:
+  reference_experiment: A28

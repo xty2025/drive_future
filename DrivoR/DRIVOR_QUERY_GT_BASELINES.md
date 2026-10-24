@@ -1,12 +1,13 @@
-# 普通 Transformer：三个 GT / Future Register 对照
+# 普通 Transformer：GT / Future Register 对照
 
-三个新实验统一使用当前单前视 DINOv3-L 和普通 Transformer，分别比较长 GT、未来 register 辅助监督，以及新的 diverse8 GT。当前已运行的配置继续保留。本轮只准备代码和命令，并做本地 smoke，没有提交 DLC 任务。
+这些实验统一使用当前单前视 DINOv3-L 和普通 Transformer，比较长 GT、未来 register 辅助监督，以及新的 diverse8 GT。新增的 **T10 `single_gt`** 从 T05 去掉长 GT，只保留原始 human GT，作为单 human、无未来 register 的基线。T10 已通过本地验证并提交 DLC `dlc1q4uo0bszf0gl`，见[部署记录](../artifacts/dlc_submissions/query_single_gt_20261022_221845/README.md)。
 
 | 配置后缀 | 普通 human | 长 GT | diverse8 | 未来 register | 总 loss |
 |---|---|---|---|---|---|
 | `single_gt_long` | L1×1 | L1×1 | — | 无 | `L_human + L_long + L_score` |
 | `single_gt_long_register` | L1×1 | L1×1 | — | 仅普通 human 匹配者对齐，L1×1 | `L_human + L_long + L_register + L_score` |
 | `human_diverse8_l1` | L1×1 | — | coverage L1×0.5 | 无 | `L_human + 0.5 L_diverse8 + L_score` |
+| **`single_gt`（T10）** | **L1×1** | **—** | **—** | **无** | **`L_human + L_score`** |
 
 ## 共用的网络与输入
 
@@ -15,14 +16,14 @@
 - 当前图像的原生 3024 个 patch 经投影得到 `[B,3024,256]`，作为轨迹预测器及 Scorer 的视觉 K/V；不加额外 scene queries。
 - 64 个可学习 Action queries，加上当前 11 维 Ego 经 Linear 得到的 256 维 embedding。
 - 4 层普通 DrivoR blocks：Self-Attention → Cross-Attention → FFN，宽度 256、FFN 1024；最后一个 MLP 输出 `[B,64,8,3]` 物理坐标轨迹。
-- 原轨迹 Scorer：24→1024→256 的轨迹投影、4 层评分 Transformer、六个评分头。三组都不向 Scorer 输入预测 registers；轨迹输入继续 detach。
+- 原轨迹 Scorer：24→1024→256 的轨迹投影、4 层评分 Transformer、六个评分头。本表四组都不向 Scorer 输入预测 registers；轨迹输入继续 detach。
 - 不使用 Action-DiT、扩散时间、加噪轨迹或 vMSE。训练与推理均为一次普通 Transformer 前向。
 
-三个新配置先按相同顺序初始化所有共用模块，再构造可选 Future 模块，因此**相同 seed 下，共享网络参数初值完全一致**。这已通过参数逐项比较与同输入推理检查。旧 query-register 配置的初始化和运行逻辑不改动。
+本表四个配置先按相同顺序初始化所有共用模块，再构造可选 Future 模块，因此**相同 seed 下，共享网络参数初值完全一致**。这已通过参数逐项比较与同输入推理检查。旧 query-register 配置的初始化和运行逻辑不改动。
 
 ## 一组 64 个 proposals，分别匹配 human 与长 GT
 
-三组都直接在米／弧度坐标上计算 L1：
+四组都直接在米／弧度坐标上计算 L1：
 
 ```text
 C(P_m, GT) = mean_8_times (|Δx| + |Δy| + |Δheading|)
@@ -61,9 +62,35 @@ L_register = L1(predicted_registers[:, m_h], EMA_teacher(human_future_RGB))
 
 这组不读取原 top4 multi-GT、CLOVER 专家包或未来视频，也不使用长 GT。缺失或无有效 diverse8 时，辅助项为 0，human L1 和 Scorer 正常计算。
 
+## T10：仅原始 human GT，无未来 register
+
+[T10 配置](navsim/planning/script/config/common/agent/drivoR_query_dinov3_vitl_single_gt.yaml) 直接继承 T05，只将 `long_trajectory_additional_poses` 从 2 改为 0；启动脚本也显式传入 0，覆盖底层原版训练入口的长 GT 默认值。
+
+每场景仍一次输出 64 条 `[8,3]` 轨迹。唯一 GT 是 NAVSIM human log 的未来 0.5～4 秒、2 Hz、8 点轨迹；按上面的物理 L1 选择一个最近 proposal，只有该候选获得轨迹回归监督。全部 64 条仍进入原 Scorer，在线计算评分标签并训练六个评分头。总损失为 `L_human + L_score`，两项权重均为 1。
+
+本配置不构造 Future queries、register head 或 EMA teacher，不读取长 GT、multi-GT、diverse8、pseudo-expert 或未来视频。DINOv3 内部的原生 register 保持其预训练结构；它们不等于未来 register 预测分支。
+
+| 对照 | 需要比较的因素 |
+|---|---|
+| T10 → T05 | 加入长 GT L1 的效果；两者网络和相同 seed 下的参数初值一致。 |
+| T10 → T01 | 单 human 条件下增加未来 register L1 辅助对齐，保持原 Scorer。 |
+| T10 → T03 | 单 human 条件下同时增加未来预测和 register 融合 Scorer 的整体效果。 |
+| T01 → T03 | 已预测 register 后，是否将其输入 Scorer。 |
+| T10 → T07 | 单 human 条件下增加 `0.5×diverse8 L1 coverage`。 |
+
+历史 T01/T03 使用较早的模块构造顺序，同一个 seed 不保证与 T10 的共享参数初值逐项相同；T10/T05 则是只改长 GT 开关的直接对照。
+
 ## DLC 启动命令：训练后自动 FP32 测试
 
 每组分别配置 **8 节点×8 GPU**，平台分发启动命令。默认每卡 batch 1、累积 1、总 batch 64、BF16 训练、seed 2、25 epochs、峰值 LR 2e-4。沿用每 epoch 保存 checkpoint 和 FP32 val PDMS；训完后自动 FP32 navtest。
+
+**新增 T10，仅原始 human GT，无 register：**
+
+```bash
+cd /cpfs29jb/data/zhaozc/project/drive_future
+export DRIVOR_RUN_ID=query_dinov3_vitl_single_gt_seed2_train_eval_run1
+bash DrivoR/scripts/training/run_drivor_query_single_gt_train_eval.sh
+```
 
 第一组，human＋长 GT，无 register：
 
@@ -89,7 +116,7 @@ export DRIVOR_RUN_ID=query_dinov3_vitl_human_diverse8_l1_seed2_train_eval_run1
 bash DrivoR/scripts/training/run_drivor_query_human_diverse8_l1_train_eval.sh
 ```
 
-仅训练时使用同名 `*_training.sh`。三组分别使用 `drivoR_query_dinov3_vitl_<配置后缀>` agent 配置。
+仅训练时使用同名 `*_training.sh`。四组分别使用 `drivoR_query_dinov3_vitl_<配置后缀>` agent 配置。
 
 输出目录：
 
@@ -109,11 +136,12 @@ bash DrivoR/scripts/evaluation/run_drivor_query_gt_evaluation.sh \
 
 ## 实现
 
-- [gt_variants.py](navsim/agents/drivoR_query_register/gt_variants.py)：共享网络、可选未来分支和三种监督。
+- [gt_variants.py](navsim/agents/drivoR_query_register/gt_variants.py)：共享网络、可选未来分支与 human / 长 GT / diverse8 监督。
 - [公共配置](navsim/planning/script/config/common/agent/drivoR_query_dinov3_vitl.yaml)。
 - [第一组配置](navsim/planning/script/config/common/agent/drivoR_query_dinov3_vitl_single_gt_long.yaml)。
 - [第二组配置](navsim/planning/script/config/common/agent/drivoR_query_dinov3_vitl_single_gt_long_register.yaml)。
 - [第三组配置](navsim/planning/script/config/common/agent/drivoR_query_dinov3_vitl_human_diverse8_l1.yaml)。
+- [T10 仅 human 配置](navsim/planning/script/config/common/agent/drivoR_query_dinov3_vitl_single_gt.yaml)。
 
 ## 本地验证
 
@@ -121,4 +149,6 @@ bash DrivoR/scripts/evaluation/run_drivor_query_gt_evaluation.sh \
 - 三份训练配置解析通过，9 个新 shell 入口通过语法检查。
 - 三组均在本地 GPU 0、1 跑通真实数据与真实 NAVSIM oracle：每卡 1 个训练 step＋1 个验证 batch，BF16 训练、FP32 验证，loss 有限。第二组读到一套有效 human 未来帧；第三组每场景读到 8 条有效 diverse8 GT。
 
-记录见 [validation.json](../artifacts/query_gt_controls_20261021/validation.json)。Smoke 用于确认数据、梯度及分布式流程，不代表完整训练后的 NAVSIM 成绩。本轮未提交 DLC 任务。
+以上是原三组的验证，记录见 [validation.json](../artifacts/query_gt_controls_20261021/validation.json)。Smoke 用于确认数据、梯度及分布式流程，不代表完整训练后的 NAVSIM 成绩。
+
+**T10 增补验证：**35 项模型与启动流程检查通过，覆盖四组共享参数初值、human-only 匹配梯度、Scorer 截断、无未来数据读取以及自动 FP32 测试。两份实际启动入口解析出的 agent 配置，唯一差异是 T10 的 `long_trajectory_additional_poses=0` 与 T05 的 `2`。本地 GPU 0、1 各跑通 1 个真实数据训练 step 和 1 个验证 batch，BF16 训练、FP32 验证；轨迹项只有 human L1，未来 loss 为 0。记录见 [T10 验证](../artifacts/query_single_gt_20261022/validation.json)。T10 已提交 8 机×8 卡 DLC，navtest 成绩待完整训练与测试后补入总表。

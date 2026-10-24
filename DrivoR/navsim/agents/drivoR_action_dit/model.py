@@ -35,8 +35,6 @@ class DrivoRActionDiTModel(nn.Module):
         if any(config[name] for name in ("double_score", "agent_pred", "area_pred", "bev_map", "bev_agent")):
             raise ValueError("Action-DiT uses the standard six DrivoR score heads")
         action = config.action_dit
-        if action.hidden_dim != config.tf_d_model:
-            raise ValueError("Action-DiT width must match DrivoR visual/ego width")
         self.num_cams = len(active_cameras)
         self.poses_num = config.num_poses
         self.proposal_num = config.proposal_num
@@ -70,9 +68,12 @@ class DrivoRActionDiTModel(nn.Module):
             hidden_dim=action.hidden_dim, action_dim=3, ffn_dim=action.ffn_dim,
             freq_dim=action.freq_dim, num_heads=action.num_heads,
             attn_head_dim=action.attn_head_dim, num_layers=action.num_layers, eps=action.eps,
-            use_gradient_checkpointing=action.gradient_checkpointing)
+            use_gradient_checkpointing=action.gradient_checkpointing, context_dim=config.tf_d_model)
         if action.pretrained_path:
-            self.action_dit.load_pretrained(action.pretrained_path)
+            if action.get('pretrained_format', 'fastwam') == 'wan22_native':
+                self.action_dit.load_wan_pretrained(action.pretrained_path)
+            else:
+                self.action_dit.load_pretrained(action.pretrained_path)
         self.schedule = ContinuousFlowSchedule(
             num_train_timesteps=action.num_train_timesteps, train_shift=action.train_shift,
             infer_shift=action.infer_shift, sigma_min=action.sigma_min)

@@ -22,6 +22,15 @@ class DiverseTrajectoryTargetBuilder(AbstractTargetBuilder):
         self.missing_policy = str(config.get('missing_policy','ignore'))
         if not self.root.is_dir():
             raise FileNotFoundError(f'Diverse8 GT root not found: {self.root}')
+        # Optional extra roots (list or comma-separated string) searched when the main root lacks a scene,
+        # e.g. the navtrain scenes with only 3 history frames, generated separately.
+        fallback = config.get('fallback_paths', None) or []
+        if isinstance(fallback, str):
+            fallback = [item for item in fallback.split(',') if item.strip()]
+        self.fallback_roots = [Path(str(item).strip()) for item in fallback]
+        for root in self.fallback_roots:
+            if not root.is_dir():
+                raise FileNotFoundError(f'Diverse8 fallback GT root not found: {root}')
         if self.missing_policy not in ('ignore','error'):
             raise ValueError('Diverse8 missing_policy must be ignore or error')
 
@@ -31,8 +40,17 @@ class DiverseTrajectoryTargetBuilder(AbstractTargetBuilder):
     def compute_targets(self, scene):
         return self.load(scene.scene_metadata.initial_token)
 
-    def load(self, token):
+    def scene_folder(self, token):
+        """The main root's scene folder, else the first fallback root that holds the complete scene."""
         folder = self.root/token
+        if not (folder/'complete.json').is_file():
+            for root in self.fallback_roots:
+                if (root/token/'complete.json').is_file():
+                    return root/token
+        return folder
+
+    def load(self, token):
+        folder = self.scene_folder(token)
         trajectories = np.zeros((self.top_k,8,3),np.float32)
         valid = np.zeros(self.top_k,bool)
         gt_like = np.zeros(self.top_k,bool)

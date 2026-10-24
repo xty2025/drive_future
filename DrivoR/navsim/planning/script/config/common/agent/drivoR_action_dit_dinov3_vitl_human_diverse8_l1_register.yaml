@@ -1,0 +1,12 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_diverse8_l1
+  - drivoR_diverse8_register_settings
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit_register.diverse_gt.DrivoRActionDiverseRegisterAgent
+
+# Preserve the baseline trajectory objective; average paired future targets equally.
+config:
+  future_register:
+    human_loss_type: velocity
+    loss_type: velocity

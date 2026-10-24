@@ -70,6 +70,12 @@ class DrivoRActionDiTAgent(DrivoRAgent):
         return super().compute_score(targets, proposals, test=test)
 
     def forward_train(self, features, targets):
+        # Native 5B uses ZeRO-2 with FP32 parameters/states. Keep its model
+        # forward in BF16, while ordinary validation remains genuinely FP32.
+        if self._config.get('action_dit', {}).get('forward_autocast_dtype') == 'bf16':
+            device = next(self._drivor_model.parameters()).device
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
+                return self._drivor_model(features, targets=targets)
         return self._drivor_model(features, targets=targets)
 
     def compute_loss(self, features, targets, pred):

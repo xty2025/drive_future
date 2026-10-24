@@ -78,7 +78,8 @@ class DrivoRActionRegisterAgent(DrivoRActionDiTAgent):
         for optimizer in optimizers:
             for group in optimizer.param_groups:
                 group['params'] = [parameter for parameter in group['params'] if parameter.requires_grad]
-            optimizer.register_step_post_hook(self._after_optimizer_step)
+            if not self._config.get('action_dit', {}).get('ema_after_lightning_step', False):
+                optimizer.register_step_post_hook(self._after_optimizer_step)
         return configured
 
     @torch.no_grad()

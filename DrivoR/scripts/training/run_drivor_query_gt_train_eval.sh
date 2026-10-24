@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DRIVOR_QUERY_GT_VARIANT="${1:?Specify single_gt_long, single_gt_long_register or human_diverse8_l1}"
+DRIVOR_QUERY_GT_VARIANT="${1:?Specify single_gt, single_gt_long, single_gt_long_register or human_diverse8_l1}"
 shift
 case "${DRIVOR_QUERY_GT_VARIANT}" in
-    single_gt_long|single_gt_long_register|human_diverse8_l1) ;;
+    single_gt|single_gt_long|single_gt_long_register|human_diverse8_l1) ;;
     *) printf 'Unknown query GT variant: %s\n' "${DRIVOR_QUERY_GT_VARIANT}" >&2; exit 2 ;;
 esac
 DRIVOR_QUERY_GT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,3 +53,10 @@ PY
     bash "${DRIVOR_QUERY_GT_ROOT}/scripts/evaluation/run_drivor_query_gt_evaluation.sh" \
         "${DRIVOR_QUERY_GT_VARIANT}" "${DRIVOR_QUERY_GT_CHECKPOINT}" "${DRIVOR_QUERY_GT_EVAL_ARGS[@]}"
 fi
+
+# DLC_HALF_CHAIN_dlc_deployment_20261024_231341: append only; exact predecessor RunIDs.
+case "${DRIVOR_RUN_ID:-}" in
+    t10_trainval_full_seed2_standalone_20261024_115236)
+        /usr/bin/python3 /cpfs29jb/data/zhaozc/project/drive_future/environment/dlc_tail_once.py --control /cpfs29jb/data/zhaozc/project/drive_future/DrivoR/exp/navtrain_half_ablations/dlc_deployment_20261024_231341/control.json
+        ;;
+esac

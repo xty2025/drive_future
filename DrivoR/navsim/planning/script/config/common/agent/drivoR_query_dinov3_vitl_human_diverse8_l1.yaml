@@ -10,6 +10,8 @@ config:
     enabled: true
     source: diverse8
     path: ${oc.env:DRIVOR_DIVERSE8_GT_ROOT,/cpfs29jb/data/zhaozc/project/Cosmos3forMultiGT/runtime/multigt_raw64/outputs/navtrain_diverse8_dense_0p1s_f64}
+    # Searched when the main root lacks a scene: the 205 navtrain scenes with only 3 history frames.
+    fallback_paths: ${oc.env:DRIVOR_DIVERSE8_GT_FALLBACK_ROOTS,/cpfs29jb/data/zhaozc/project/Cosmos3forMultiGT/runtime/multigt_raw64/outputs/navtrain_diverse8_hist3_dense_0p1s_f64}
     top_k: 8
     loss_type: l1
     weight: 0.5
