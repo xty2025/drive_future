@@ -1,0 +1,21 @@
+hydra:
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+
+defaults:
+  - half_training_defaults
+  - override /agent: drivoR_half_a28_wan5b
+  - _self_
+
+experiment_name: training_drivoR_half_a28_wan5b
+# Keep the 42,555 selected train scenes and the entire original val split.
+agent:
+  scheduler_args:
+    dataset_size: 42555
+
+# ZeRO-2 shards optimizer/gradients for the native 5B backbone. Model forward
+# uses BF16 autocast; FP32 parameters allow unchanged FP32 per-epoch validation.
+trainer:
+  params:
+    strategy: deepspeed_stage_2
+    precision: 32-true

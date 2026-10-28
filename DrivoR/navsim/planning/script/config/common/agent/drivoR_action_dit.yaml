@@ -1,0 +1,51 @@
+defaults:
+  - drivoR
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit.agent.DrivoRActionDiTAgent
+
+config:
+  visual_feature_mode: native_patches
+  # Only the current front image, at DrivoR's 1148x672 resolution.
+  # Native CLS + four registers stay inside DINO; downstream uses patch tokens.
+  cam_f0: [3]
+  cam_l0: []
+  cam_l1: []
+  cam_l2: []
+  cam_r0: []
+  cam_r1: []
+  cam_r2: []
+  cam_b0: []
+  lidar_pc: []
+  num_scene_tokens: 0
+  full_history_status: false
+  long_trajectory_additional_poses: 2
+  image_backbone:
+    gradient_checkpointing: true
+    use_grid_mask: true
+  action_dit:
+    pretrained_path: /cpfs29jb/data/zhaozc/project/FastWam_re/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_256hdim_1024ffn_3outdim.pt
+    hidden_dim: 256
+    ffn_dim: 1024
+    freq_dim: 256
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    eps: 1.0e-6
+    gradient_checkpointing: true
+    num_train_timesteps: 1000
+    train_shift: 5.0
+    infer_shift: 5.0
+    sigma_min: 0.1
+    # FastWAM configs/train.yaml evaluation default; each step converts X to V.
+    num_inference_steps: 10
+    # Normal and long GT have independent best-of-64 velocity losses.
+    loss_reduction: best_of_k
+
+loss:
+  _target_: navsim.agents.drivoR_action_dit.loss.DrivoRActionDiTLoss
+  trajectory_weight: 1.0
+  final_score_weight: 1.0
+
+checkpoint_path: ''
+accumulate_grad_batches: ${trainer.params.accumulate_grad_batches}

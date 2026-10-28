@@ -1,0 +1,9 @@
+defaults:
+  - drivoR_query_dinov3_vitl_single_gt_long
+  - _self_
+
+# Only the ordinary human winner aligns to human future RGB at +0.5,...,+4s.
+# Long GT still contributes its own trajectory L1 on the same 64 proposals.
+config:
+  future_register:
+    enabled: true

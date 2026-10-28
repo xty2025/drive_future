@@ -1,0 +1,19 @@
+defaults:
+  - drivoR_action_dit_multigt
+  - _self_
+
+# Same front camera, Action-DiT, ego, equal-GT loss and scorer as the parent.
+# Scene queries can be enabled through visual_feature_mode / num_scene_tokens.
+config:
+  # W,H: resize directly to patch16-aligned dimensions in the data builder.
+  image_size: [1152, 672]
+  multi_gt:
+    matching: nearest
+    weighting: equal
+  image_backbone:
+    family: dinov3
+    model_name: dinov3_vits16
+    model_weights: ${oc.env:DRIVOR_DINOV3_VITS_WEIGHTS,weights/dinov3/vits16/model.safetensors}
+    use_lora: true
+    lora_rank: 32
+    finetune: false

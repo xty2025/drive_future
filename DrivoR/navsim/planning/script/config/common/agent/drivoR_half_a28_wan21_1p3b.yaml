@@ -1,0 +1,15 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer
+  - _self_
+
+# Independent A28 ablation: native Wan2.1 1.3B replaces only the joint DiT.
+config:
+  action_dit:
+    hidden_dim: 1536
+    ffn_dim: 8960
+    num_heads: 12
+    attn_head_dim: 128
+    pretrained_format: wan21_native
+    pretrained_path: /cpfs29jb/data/zhaozc/project/FastWam_re/checkpoints/Wan-AI/Wan2.1-T2V-1.3B
+    forward_autocast_dtype: bf16
+    ema_after_lightning_step: true

@@ -1,0 +1,8 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer
+  - _self_
+
+# Independent ablation: inherit A28 directly, never another ablation.
+config:
+  future_register:
+    token_order: register_first

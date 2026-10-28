@@ -1,0 +1,26 @@
+defaults:
+  - drivoR
+  - _self_
+
+_target_: navsim.agents.drivoR_world.agent.DrivoRWorldAgent
+
+config:
+  bank:
+    enabled: true
+    path: ${oc.env:DRIVOR_BANK_PACK,${oc.env:NAVSIM_EXP_ROOT}/world4scorer_data/bank_clover}
+    capacity: 64
+    count: 16
+    safety_fraction: 0.5
+    weight: 0.5
+    missing_policy: ignore
+  future:
+    enabled: false
+    path: ${oc.env:DRIVOR_FUTURE_FEATURES,${oc.env:NAVSIM_EXP_ROOT}/world4scorer_data/future_real_vjepa21}
+    times: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+    embedding_dim: 1024
+    max_gt: 1
+    weight: 1.0
+    num_layers: 4
+    num_heads: 8
+    detach_context: true
+    missing_policy: ignore

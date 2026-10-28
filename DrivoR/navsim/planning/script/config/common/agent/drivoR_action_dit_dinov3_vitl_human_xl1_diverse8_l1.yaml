@@ -1,0 +1,11 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_diverse8_l1
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit.x_l1.DrivoRActionDiTDiverseGTXL1Agent
+
+# Human best-of-64 physical X L1 + 0.5 * diverse8 physical L1 coverage.
+# No X-to-v conversion, sigma scaling or timestep weighting in either L1 term.
+config:
+  action_dit:
+    loss_reduction: best_of_k

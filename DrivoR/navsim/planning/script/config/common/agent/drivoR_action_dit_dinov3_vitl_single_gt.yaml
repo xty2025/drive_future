@@ -1,0 +1,9 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl
+  - _self_
+
+config:
+  # Human trajectory only: still predict 64 candidates and use best-of-64 v loss.
+  long_trajectory_additional_poses: 0
+  multi_gt:
+    enabled: false

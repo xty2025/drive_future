@@ -1,0 +1,18 @@
+config:
+  future_register:
+    enabled: true
+    stage: joint
+    frames_root: ${oc.env:DRIVOR_DIVERSE8_FRAMES_ROOT,${oc.env:NAVSIM_EXP_ROOT}/world4scorer_data/frames_diverse8}
+    rollouts_root: ${oc.env:DRIVOR_DIVERSE8_ROLLOUTS_ROOT,/cpfs29jb/data/zhaozc/project/Cosmos3forMultiGT/runtime/rollouts/navtrain_diverse8_full_allcosmos_cuda_v1_gpu256}
+    build_missing_cache: true
+    image_size: [384, 384]
+    sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT}/sensor_blobs/trainval
+    loss_type: velocity
+    human_loss_type: velocity
+    loss_weight: 1.0
+    ema_decay: 0.999
+    teacher_batch_size: 4
+    init_checkpoint: null
+    scorer:
+      enabled: false
+      fusion: project

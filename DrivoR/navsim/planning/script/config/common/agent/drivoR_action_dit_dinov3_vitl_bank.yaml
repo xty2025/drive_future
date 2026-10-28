@@ -1,0 +1,16 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit.auxiliary.DrivoRActionDiTAuxiliaryAgent
+
+# Preserve the DINOv3-L single-front, equal nearest multi-GT baseline.
+config:
+  bank:
+    enabled: true
+    path: ${oc.env:DRIVOR_BANK_PACK,${oc.env:NAVSIM_EXP_ROOT}/world4scorer_data/bank_clover}
+    capacity: 64
+    count: 16
+    safety_fraction: 0.5
+    weight: 0.5
+    missing_policy: ignore

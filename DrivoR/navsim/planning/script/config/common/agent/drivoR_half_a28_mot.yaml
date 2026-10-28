@@ -1,0 +1,24 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_register_scorer
+  - _self_
+
+# A28 Action256 + native Wan2.2 video expert predicting DINO future registers.
+# Register queries read both experts; Action queries only read Action K/V.
+config:
+  action_dit:
+    forward_autocast_dtype: bf16
+    ema_after_lightning_step: true
+  future_register:
+    generator_kind: mot
+    mot:
+      video_dit:
+        hidden_dim: 3072
+        ffn_dim: 14336
+        freq_dim: 256
+        num_heads: 24
+        attn_head_dim: 128
+        num_layers: 30
+        eps: 1.0e-6
+        gradient_checkpointing: true
+        pretrained_format: wan22_native
+        pretrained_path: /cpfs29jb/data/zhaozc/project/FastWam_re/checkpoints/Wan-AI/Wan2.2-TI2V-5B

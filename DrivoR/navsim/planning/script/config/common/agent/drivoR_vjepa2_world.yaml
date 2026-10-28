@@ -1,0 +1,10 @@
+defaults:
+  - drivoR_bank
+  - drivoR_vjepa2_vitl
+  - _self_
+
+_target_: navsim.agents.drivoR_world.agent.DrivoRWorldAgent
+
+config:
+  future:
+    enabled: true

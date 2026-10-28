@@ -1,0 +1,16 @@
+defaults:
+  - drivoR_action_dit_multigt
+  - _self_
+
+config:
+  image_size: [1152, 672]
+  multi_gt:
+    matching: nearest
+    weighting: equal
+  image_backbone:
+    family: dinov3
+    model_name: dinov3_vitl16
+    model_weights: ${oc.env:DRIVOR_DINOV3_VITL_WEIGHTS,weights/dinov3/vitl16/model.safetensors}
+    use_lora: true
+    lora_rank: 32
+    finetune: false

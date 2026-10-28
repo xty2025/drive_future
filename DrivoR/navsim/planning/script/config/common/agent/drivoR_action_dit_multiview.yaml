@@ -1,0 +1,24 @@
+defaults:
+  - drivoR_action_dit
+  - _self_
+
+# Keep the Action-DiT, ego, scorer, loss and pretrained initialization unchanged.
+# Only replace the visual input with the original DrivoR four-camera query path.
+config:
+  visual_feature_mode: drivor_queries
+  cam_f0: [3]
+  cam_l0: [3]
+  cam_l1: []
+  cam_l2: []
+  cam_r0: [3]
+  cam_r1: []
+  cam_r2: []
+  cam_b0: [3]
+  lidar_pc: []
+  # Per camera: 16 learned queries + native CLS/register/patch tokens inside DINO.
+  # Downstream: only the 16 query outputs from each camera, 4*16=64 visual tokens.
+  num_scene_tokens: 16
+  image_backbone:
+    focus_front_cam: false
+    use_feature_pooling: false
+    compress_fc: false

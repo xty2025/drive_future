@@ -1,0 +1,45 @@
+defaults:
+  - training_runtime_defaults
+  - _self_
+
+# Full entry merges train_logs and val_logs. The original val subset is a
+# training monitor, and does not remain held out after this union.
+split: trainval
+cache_path: null
+use_cache_without_dataset: false
+auto_resume: false
+train_ckpt_path: null
+seed: 2
+runtime:
+  training_data_scope: trainval
+  scheduler_dataset_size_from_data: true
+  validation_is_training_subset: true
+  rank_seeded_training: true
+  validation_fp32: true
+
+full_training:
+  reference_experiment: null
+  validation_role: training_subset_monitor
+
+agent:
+  lr_args:
+    name: AdamW
+    base_lr: 0.0002
+  # Replaced with len(train_data) at runtime if the scene filter changes.
+  scheduler_args:
+    dataset_size: 103288
+  num_gpus: 64
+
+dataloader:
+  params:
+    batch_size: 1
+    num_workers: 4
+    prefetch_factor: 2
+
+trainer:
+  params:
+    max_epochs: 25
+    precision: bf16-mixed
+    num_nodes: 8
+    devices: 8
+    accumulate_grad_batches: 1

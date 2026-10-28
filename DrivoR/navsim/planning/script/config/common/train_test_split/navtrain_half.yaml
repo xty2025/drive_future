@@ -1,0 +1,6 @@
+# Half of navtrain's training tokens, with every original validation token kept.
+# The train/val log lists are unchanged; run_training.py intersects them below.
+defaults:
+  - scene_filter: navtrain_half
+
+data_split: trainval

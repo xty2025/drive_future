@@ -1,0 +1,8 @@
+defaults:
+  - drivoR_query_register_dinov3_vitl
+  - _self_
+
+config:
+  multi_gt:
+    enabled: true
+    max_gt: 4

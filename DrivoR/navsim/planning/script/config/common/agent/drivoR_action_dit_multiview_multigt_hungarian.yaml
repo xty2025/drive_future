@@ -1,0 +1,8 @@
+defaults:
+  - drivoR_action_dit_multiview_multigt
+  - _self_
+
+config:
+  multi_gt:
+    matching: hungarian
+    weighting: equal

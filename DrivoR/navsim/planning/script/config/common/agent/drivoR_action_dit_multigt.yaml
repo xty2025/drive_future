@@ -1,0 +1,13 @@
+defaults:
+  - drivoR_action_dit
+  - _self_
+
+config:
+  long_trajectory_additional_poses: 0
+  multi_gt:
+    enabled: true
+    root: ${oc.env:DRIVOR_MULTI_GT_ROOT,/cpfs29jb/data/zhaozc/project/drive_future/multi_traj_gt_data/navtrain_multigt_top4_dense_0p1s_f64_8gpu}
+    max_gt: 4
+    missing_policy: original
+    # All 64 noisy inputs use the original human GT; multi-GT only changes loss matching.
+    input_gt_assignment: original

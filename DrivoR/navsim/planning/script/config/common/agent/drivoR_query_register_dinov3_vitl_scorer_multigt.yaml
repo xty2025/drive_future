@@ -1,0 +1,8 @@
+defaults:
+  - drivoR_query_register_dinov3_vitl_multigt
+  - _self_
+
+config:
+  future_register:
+    scorer:
+      enabled: true

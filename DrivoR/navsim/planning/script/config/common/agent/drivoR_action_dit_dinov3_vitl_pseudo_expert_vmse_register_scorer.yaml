@@ -1,0 +1,10 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_pseudo_expert_vmse_register
+  - _self_
+
+# Compress each candidate's detached 32 registers, then concatenate with
+# its detached trajectory embedding before the shared DrivoR scorer.
+config:
+  future_register:
+    scorer:
+      enabled: true

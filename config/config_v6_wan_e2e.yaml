@@ -1,0 +1,487 @@
+spec_version: '6.0'
+# The id still names the superseded R->A direction.  It is a frozen identifier that
+# recorded artifacts quote; action_dit.token_order and the *_reads_* flags below are
+# what assert the real (V-JEPA style, future-reads-action) layout.
+spec_id: navsim_future_register_R_to_A_v6
+benchmark:
+  name: navsim_v1
+  navsim_commit: fc6e5aa144bbcb5a046e22c18f1bd5cf3af8634a
+  oracle_source_commit: fc6e5aa144bbcb5a046e22c18f1bd5cf3af8634a
+  metric_cache_root: /mnt/zhaozc_workspace/project/DrivoR_multigt_kvcache_final_20261004/data_runtime/train_metric_cache
+  metric_cache_index: null
+  train_split_manifest: null
+  validation_split_manifest: null
+  test_split_manifest: null
+observation:
+  cameras: [front]
+  times_s: [-2.0, -1.5, -1.0, -0.5, 0.0]
+  history_frames: 4
+  history_valid_mask: true
+  ego_time_limit_s: 0.0
+future_target:
+  source: generated_multiview_future_mp4
+  camera: front
+  times_s: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+  # Several register targets per decoded future frame, one per DINOv3 prefix query.  An
+  # earlier revision paired the frames up ([[0.5, 1.0], [1.5, 2.0], ...]) and compressed
+  # each pair into one 8D vector, so four register tokens covered the whole horizon.
+  # That folded +0.5s and +1.0s into a single linear subspace and the token could only
+  # tell them apart through the shape of the PCA basis.  Per-frame targets give the
+  # register a 1:1 correspondence with the eight future timestamps and the eight
+  # trajectory poses it is conditioned on, and keep the full 4s horizon that PDMS
+  # actually scores.  The per-frame multiplicity below multiplies the token count and
+  # leaves that correspondence intact: it is per frame, with one frame's queries
+  # contiguous and frame-major, so token ``q + 4*f`` is query ``q`` of frame ``f``.
+  temporal_pooling: none_registers_per_future_frame
+  registers_per_frame: 4
+  registers_per_gt: 32
+  max_unique_gt: 4
+  teacher: fixed_frozen_dinov3
+  teacher_checkpoint: /mnt/LLM_weight/timm/vit_large_patch16_dinov3.lvd1689m/model.safetensors
+  # The Teacher encodes the future videos at the resolution they were generated
+  # in.  464x832 is a whole number of patch16 tiles (29x52), so nothing is
+  # resampled in either direction and every target patch summarises pixels the
+  # generator actually rendered.  Its grid is coarser than the Student's 42x72 and
+  # that is deliberate: DINOv3's RoPE divides coordinates by H and W separately
+  # (make_coords_dinov3, normalize_coords='separate') and maps them to [-1, 1], so
+  # a token's position depends on where it sits in the frame, not on how many
+  # tokens the frame was cut into.  The regions the CLS query selects are fractions
+  # of the frame for the same reason.  Upscaling 464x832 to the Student's size
+  # instead would invent ~1.4x more pixels than exist.
+  teacher_image_hw: [464, 832]
+  teacher_grid_hw: [29, 52]
+  teacher_resize_filter: none_native_resolution_no_interpolation
+  teacher_shares_student_checkpoint: true
+  rope_normalizes_coords_per_axis: true
+  # The target is four attention readouts per future frame: DINOv3's own four prefix
+  # *register* tokens each query the frame's 29x52 patch grid by cosine similarity at a
+  # fixed low temperature, over several independent heads, and each readout is the
+  # resulting convex combination of patch tokens.  It replaces an ordered-2x2 quadrant
+  # mean pool.  A two-way ANOVA on real Teacher features put 81.0% of the GT-
+  # discriminating variance in the GT-specific spatial pattern and only 19.0% in the
+  # per-GT average level, and the pool kept only the 19%; ordered-2x2 bought ~3% more
+  # relative separation at four times the width.
+  #
+  # Why the registers rather than the CLS, both as query and as target.  Measured on 12
+  # scenes (48 GTs, 384 frames) after standardization:
+  #
+  #   readout                  separation   corr(target dist, trajectory dist)
+  #   patch mean pool            0.157        --
+  #   cls token verbatim         0.211       0.688
+  #   4 registers verbatim       0.194        --
+  #   cls + 4 registers          0.199        --
+  #   CLS as query               0.456       0.684   (the previous production readout)
+  #   4 registers as queries     0.458       0.771   <-- chosen
+  #
+  # So CLS alone is *not* enough: read out verbatim it is barely above a mean pool, and
+  # used as a query it lands on a handful of pixels (normalized entropy 0.36-0.43, top-32
+  # patch mass 0.987) whose content is trajectory-specific but single-region.  The four
+  # registers read verbatim are no better than it -- they are queries, not summaries.
+  # Used as queries in the same cosine attention they land on complementary regions
+  # (left road edge, right verge, intersection, traffic furniture) and the correlation
+  # with trajectory distance rises to 0.771, a 1.43x lift over the CLS query at equal
+  # separation.  Four is DINOv3's own prefix count, so "more tokens" means the Teacher's
+  # trained queries rather than an invented split of the grid; the visualizations are in
+  # artifacts/future_readout_probe/.
+  spatial_readout: dinov3_register_query_cosine_attention_over_patch_grid
+  query_temperature: 0.005
+  query_heads: 8
+  # tau was chosen on both numbers, not on separation alone, and the full sweep with
+  # its per-tau entropy lives next to the constants it produced, in
+  # src/nvs_v6_wan_e2e/teacher.py.  The reason it is not a one-number decision: the
+  # random-query control reached separation 0.4957 -- level with the CLS query's
+  # 0.4934 and above the full-patch target's 0.3903 -- while its trajectory
+  # correlation was 0.4121 against the CLS query's 0.6647, so a high ratio can
+  # equally mean "kept the trajectory signal" or "threw the scene away into noise".
+  # At tau=0.005 the readout keeps 0.6890 of full-patch's 0.7578; below it separation
+  # still climbs while correlation falls toward the control's.  The sweep itself was run
+  # with the single CLS query; the register readout that replaced it was then measured at
+  # this same tau against that CLS query on identical scenes (0.458/0.771 against
+  # 0.456/0.684), so the comparison is at matched temperature and tau is not re-tuned per
+  # query set.
+  query_temperature_rationale: chosen_on_separation_ratio_and_trajectory_correlation_together
+  # The readout has NO parameters.  The queries are each frame's own four DINOv3 prefix
+  # registers and the logits are cosine at a fixed temperature, so the target is a
+  # constant function of the frozen backbone.  A learned extractor would move the target
+  # while the Student chases it, which is exactly how a predict/target pair collapses;
+  # baking a parameter-free readout into the cache is what makes non-collapse structural
+  # rather than hoped for.  A randomly initialized learnable query was measured to be
+  # useless on its own terms anyway: attention entropy 0.999997 of log2(P), a mean
+  # pool wearing an attention costume.  The registers are not randomly initialized --
+  # they are DINOv3's own prefix queries, trained through 24 layers on a billion-scale
+  # corpus, which is the same argument that disqualified a learned query for the CLS.
+  query_is_parameter_free: true
+  # Uniform attention is this design's silent failure, and it has the same shape as
+  # the rank deficiency the PCA target had: every downstream number stays finite and
+  # 81% of the discriminating variance is gone.  The cache builder refuses to persist
+  # past this ceiling.  0.75 sits in a measured gap rather than being tuned -- every
+  # selective operating point lands at or below 0.623 and every degenerate one at or
+  # above 0.936.  The ceiling was 0.5 while the readout had one query; four queries
+  # each covering one region instead of all of them are inherently flatter per query
+  # (0.594-0.623 measured), so 0.5 would have rejected the readout that measurably
+  # tracks trajectory distance better.
+  max_query_attention_entropy: 0.75
+  # The target is the Teacher's own feature width *per token*, not d_model: each readout
+  # is a convex combination of 1024-d patch tokens and standardization is diagonal, so
+  # nothing between the backbone and the cache changes the width.  Raising
+  # registers_per_frame multiplies the token count and leaves this alone, which is why
+  # the future head stays Linear(d_model, 1024).  It is reported by the Teacher and
+  # recorded by both the cache and the Stage 1 checkpoint rather than requested on a
+  # command line, because a caller-supplied value would only be a way to get it wrong.
+  register_target_dim: 1024
+  compression: dinov3_register_query_cosine_attention_then_train_only_frozen_diagonal_standardization
+  # Standardization is a loss-weighting choice, not an information-preserving one.
+  # An L1 over raw DINOv3 coordinates is almost entirely the highest-variance
+  # dimensions, and those are scene-level rather than trajectory-level, so the loss
+  # would spend capacity on the part the Scene tokens already provide -- the measured
+  # Stage 1 failure, where a trajectory-blind per-scene-mean memorizer reached 0.5839
+  # against the trained register's 0.7515.  Dividing each dimension by its own train
+  # std equalises them; the floor stops genuinely degenerate dimensions from being
+  # lifted to the same weight.  Mean and scale are part of the fingerprint, so
+  # targets cached with them are not comparable to targets cached without.
+  target_std_floor: 0.01
+  # Unlike the PCA projector this replaced, a diagonal mean/std has no subspace and
+  # therefore no rank: no dimension is ever bitwise zero, and the number of fit
+  # scenes affects only how well the mean and std are estimated, never whether the
+  # target is degenerate.  That is why --fit-scenes is a precision knob and not a
+  # gate, and why the rank check and --allow-rank-deficient-target are gone.
+  standardizer_note: diagonal mean/std, no basis and no rank; fit-scenes sets estimation precision only
+  target_cache_root: null
+  online_nvs: false
+  teacher_targets_as_model_inputs: false
+vision:
+  backbone: timm/vit_large_patch16_dinov3.lvd1689m
+  checkpoint: /mnt/LLM_weight/timm/vit_large_patch16_dinov3.lvd1689m/model.safetensors
+  base_trainable: false
+  frozen_base_kept_in_eval: true
+  # DrivoR's official image_size is [1148, 672] (W, H), chosen for patch14 DINOv2
+  # where 1148 = 14*82 exactly.  DINOv3 is patch16 and cannot tile that width, so
+  # the 12 px remainder is closed by resampling the width up to 1152 -- DrivoR's
+  # own methodology of resizing to the backbone resolution -- and the rotary
+  # position encoding is then built analytically for the 42x72 grid.  Zero columns
+  # are refused: padding the image would fabricate patch content.
+  drivor_image_hw: [672, 1148]
+  right_resample_px: 4
+  bottom_resample_px: 0
+  right_zero_pad_px: 0
+  bottom_zero_pad_px: 0
+  image_hw: [672, 1152]
+  patch_size: [16, 16]
+  patch_grid: [42, 72]
+  image_patches: 3024
+  history_resize: pil_bicubic_downscale_from_1920x1080_as_drivor
+  student_resampling: bicubic_to_patch_multiple
+  native_prefix_tokens: 5
+  num_scene_tokens: 16
+  frames: 5
+  views: 1
+  visual_tokens: 80
+  ego_tokens: 1
+  scene_tokens: 81
+  position_encoding: dinov3_rope_analytic_no_interpolation
+  rope_prefix_tokens: 21
+  student_lora:
+    enabled: true
+    rank: 32
+    qv_only: true
+    a_initialization: kaiming_uniform_a_sqrt5
+    b_initialization: zeros
+    wrapped_module: attn.qkv
+  scene_query_patch: prepend_after_native_prefix_before_image_patches
+  scene_query_participates_in_backbone_qkv: true
+  whole_student_no_grad: false
+  permanent_student_feature_cache: false
+modes:
+  count: 64
+  grid: [8, 8]
+  initializer: audited_existing_8x8_or_v6_fallback
+  shared_code: immutable_exogenous_2d_U
+  shared_trainable_mode_embedding: false
+  codebook_is_buffer: true
+  codebook_hash: null
+  source_uses_gt: false
+  action_jitter_std_normalized: 0.0
+  eval_jitter_std_normalized: 0.0
+  eval_seed: 17
+model:
+  d_model: 256
+  heads: 4
+  ffn_dim: 1024
+  depth: 8
+  action_tokens: 8
+  # register_tokens = register_frames * future_target.registers_per_frame = 8 * 4.
+  # Both are asserted against EXPECTED_REGISTER_TOKENS in config.py, which derives the
+  # product from the loader's FUTURE_FRAMES and the Teacher's REGISTER_QUERIES_PER_FRAME
+  # rather than reading it off this file.
+  register_tokens: 32
+  register_frames: 8
+  trajectory_state_dim: 3
+  trajectory_units: metric_xy_metres_heading_radians
+  trajectory_rescaling: none
+  ego_observable_dim: 11
+  ego_tokens: 1
+  # The DiT sequence is [scene(81) | action(8) | register(32)] = 121 tokens -- FastWAM's
+  # layout, which prepends its visual tokens to the action tokens and keeps "Action
+  # RoPE 0..T-1 even though visual tokens are prepended".  Scene is embedded once by
+  # text_embedding (as Wan's pre_dit does) and used twice: prepended into
+  # self-attention, and kept as the cross-attention K/V so Wan's pretrained cross_attn
+  # still sees the read-only context it was trained on.
+  #
+  # Self-attention is MASKED, and there is exactly ONE table, shared by every stage
+  # and every entry point.  It is block lower-triangular: the register reads the
+  # action beside it, and the action NEVER reads the register.  That last arrow is a
+  # structural invariant rather than a training choice -- the predicted future cannot
+  # reach the velocity head, so the register is a pure auxiliary readout whose
+  # gradient shapes the shared block stack (V-JEPA's predictor shaping its encoder)
+  # without conditioning a single emitted waypoint.  Keeping Action -> Register open
+  # is what makes the register non-trivial: encode_future supplies no trajectory and
+  # no mode code, so closing it would leave the register a function of (Scene, ego)
+  # alone and bitwise identical across the K Multi-GT rows of one scene.  Rows are
+  # queries, columns are keys, and Scene reads only itself -- which is what leaves the
+  # scorer's K/V untouched by the ActionDiT.
+  token_order: [scene, action, register]
+  token_counts: [81, 8, 32]
+  self_attention_mask: single_segment_block
+  segment_visibility: [[1, 0, 0], [1, 1, 0], [1, 1, 1]]
+  cross_attention_context: scene
+  scene_embedded_once_used_for_self_and_cross_attention: true
+  future_reads_action: true
+  action_reads_future: false
+  future_self_causal: false
+  scene_in_self_attention: true
+  scene_written_by_action_dit: false
+  scene_returned_to_scorer_is_unfused: true
+  # RoPE restarts per segment: scene 0..80 (a spatial grid), action 0..7 (Wan's own
+  # pretrained positions, unmoved), register 0..7 repeated four times.  Action and
+  # register sharing the phase is the correct alignment, not a shortcut: register token
+  # q + 4*f is a read of the future frame at (f+1)*0.5s and action token f is the
+  # waypoint at the same instant, so a shared phase makes that one-to-one temporal
+  # correspondence free instead of something attention must discover.  The repeat is
+  # what keeps that true now that one frame contributes four tokens: counting 0..31
+  # would place a single frame's four queries at four different times and stretch the
+  # segment past every action position it is supposed to line up with.  The queries of
+  # one frame are told apart by future_queries and register_type_embedding, which is
+  # what those exist for -- RoPE carries time and nothing else.
+  rope: per_segment_restart_at_zero
+  register_rope_phase: frame_index_repeated_per_query
+  segment_type_embeddings: [scene_type_embedding, action_type_embedding, register_type_embedding]
+  segment_type_embedding_init: randn_scaled_0.02
+  # The future assists the generator only through shared weights.  An earlier revision
+  # had an explicit channel -- future_fuse, which cross-attended an EMA copy of theta's
+  # register into the ACTION tokens during Stage 2 -- and it was removed because it was
+  # a Register -> Action bypass of exactly the mask above.  It had a second, independent
+  # defect: the register segment receives no mode code, so its output was identical
+  # across all candidates of a scene and the fusion could not have ranked them.
+  future_is_auxiliary_readout_only: true
+  block_schedule: scene_refinement_then_joint_scene_action_register_dit
+  # F0 is the learned future queries plus the projected clean Ego encoding, and
+  # nothing else.  The metric trajectory is deliberately NOT projected into F0: the
+  # queries sit behind the action tokens in the same self-attention, so they read
+  # the flow state by attending to it.  That is the only conditioning that cannot
+  # be short-cut from a per-row code -- the reason the old trajectory_projection had
+  # to be zero-initialised and its mode code suppressed at Stage 1.
+  future_query_init_inputs: [learned_future_queries, projected_clean_ego]
+  action_init_inputs: [source, immutable_mode_code, action_time_embedding, projected_clean_ego]
+  clean_ego_source: [current_pose3, current_velocity2, current_acceleration2, route_command4]
+  clean_ego_drivor_order: [pose3, velocity2, acceleration2, route_command4]
+  clean_ego_encoding: single_linear_11_to_d_model
+  clean_ego_shared_before_action_projection: true
+  dropout: 0.0
+  output: endpoint_plus_predicted_register
+  action_codec: drivor_metric_xy_heading
+  action_branch: simwan_action_dit_wan22_initialized
+  action_dit:
+    hidden_dim: 256
+    ffn_dim: 1024
+    num_layers: 8
+    num_heads: 4
+    attn_head_dim: 64
+    text_dim: 256
+    freq_dim: 256
+    eps: 0.000001
+    action_dim: 3
+    future_tokens: 32
+    # The future head's OUTPUT width, which is the Teacher's feature width *per token*
+    # and not hidden_dim.  Named register_target_dim rather than target_dim because
+    # --target-dim on every command line means d_model, and the two stopped being
+    # equal when the target became a query extraction: folding them into one number
+    # would widen the whole DiT to 1024 and then fail Wan's own
+    # num_heads * attn_head_dim == hidden_dim check (4 * 64 == 256).  Widening the
+    # target went into future_tokens (8 -> 32) instead, which leaves this head at
+    # Linear(256, 1024) and the loss an element-mean, so the L1's scale did not move.
+    register_target_dim: 1024
+    # Load-bearing since the segment went to four queries per frame: those queries share
+    # one RoPE phase on purpose, so this init is the only thing separating the four reads
+    # of a single frame at step 0.  At the previous 0.02 they started 2.8% apart and were
+    # told apart almost entirely by position.  Pinned against wan_dit.FUTURE_QUERY_SCALE.
+    future_query_init: randn_scaled_0.5_not_exact_zero
+    future_head: [layernorm_no_affine, linear_hidden_to_target]
+    qk_rmsnorm_before_rope: true
+    self_attention_rope: true
+    cross_attention_rope: false
+    modulation_segments_per_block: 6
+    modulation_segments_in_head: 2
+    ffn_activation: gelu_tanh
+  wan_backbone:
+    source: /mnt/LLM_weight/Wan-AI/Wan2.2-TI2V-5B
+    payload: checkpoints/ActionDiT_Wan22_256hdim_3outdim.pt
+    source_layers: 30
+    layer_map: [0, 3, 7, 11, 15, 18, 22, 26]
+    interpolation: sequential_1d_linear_align_corners_true
+    alpha_scaling: true
+    skip_prefixes: [action_encoder., head., mode_projection., ego_to_action_projection., time_queries, future_queries, future_head., scene_type_embedding, action_type_embedding, register_type_embedding]
+    loaded_keys: 226
+    load_strictness: strict_true_full_state_dict
+  # theta is a rectified-flow denoiser: the anchor grid is the sigma=1 prior, each
+  # candidate's matched GT is the sigma=0 data endpoint, and Stage 2 draws one
+  # random t per scene per forward.  The deployed path is still ONE forward at
+  # sigma=1, so the inverse x0 = x_sigma - sigma*v returns a metric trajectory
+  # with no rollout and the anchors' oracle-best PDMS is preserved at init.
+  action_sampling_loops: 0
+  random_flow_time_training: true
+  # The trajectory does condition the future representation, but through attention
+  # inside the DiT rather than through a readout projection into a separate branch.
+  # Measured on 16 real scenes, two GTs' compressed targets sit 0.205 apart against
+  # 0.542 across scenes, so the signal a trajectory-conditioned future has to carry
+  # exists; the anchor-only Stage 1 recovered 0.4% of it.
+  physical_trajectory_to_future_conditioning: joint_self_attention
+  register_stage1_mode_code: zeroed_to_prevent_row_index_shortcut
+  stage1_pairing: identity_one_register_row_per_gt
+  stage1_hungarian: unused_pairing_is_given_by_the_dataset
+scorer:
+  source: vendor/DrivoR/navsim/agents/drivoR
+  implementation: ScratchDrivoRScorer
+  initialization: scratch_random_no_drivor_checkpoint
+  feature_source: nvs_dinov3_scene_context
+  native_dinov2_scene_cache: false
+  native_ego_cache: false
+  candidates: 64
+  poses_per_candidate: 8
+  d_model: 256
+  trajectory_projection: [linear_24_1024, relu, linear_1024_256]
+  candidate_decoder_layers: 4
+  decoder_attention_heads: 1
+  head_hidden_dim: 1024
+  projection_dropout: 0.1
+  drop_path: 0.2
+  own_future_attention_layers: 0
+  sequence: [candidate_self_attention, nvs_scene_cross_attention, nvs_ego_token_addition, drivor_six_heads]
+  ego_pool: last_scene_token
+  cross_candidate_attention_after_future: false
+  predicted_register_is_input: false
+  # DrivoR detaches only the proposals (`pos_embed(proposals...detach())`,
+  # drivor_model.py:247) and feeds `scene_features` in attached (line 248), so
+  # the score loss does shape the Scene branch.  NVS reproduces that exactly.
+  input_detach: [trajectory, predicted_register]
+  scene_kv_detached: false
+  updates_generator: false
+  updates_trajectory_branch: false
+  updates_register: false
+  updates_scene_lora: true
+  future_fusion: none
+  train_future_dropout: 0.0
+  head_names: [NC, DAC, DDC, TTC, EP, C]
+  label_policy: drivor_nc_ddc_half_to_zero_otherwise_raw_soft_targets
+  ttc_invalid_sentinel: 2.0
+  head_loss_weights: {NC: 1.0, DAC: 1.0, DDC: 1.0, TTC: 1.0, EP: 1.0, C: 1.0}
+  selection_weights: {NC: 1.0, DAC: 1.0, DDC: 0.0, TTC: 5.0, EP: 5.0, C: 2.0}
+  rank_aux_enabled: false
+  native_drivor_optional_aux_heads: false
+oracle:
+  supervision: online_current_full64
+  scene_cache_lru: true
+  candidate_score_cache_as_training_source: false
+  backend: audited_drivor_compatible_pdm
+  raw_order: [NC, DAC, EP, TTC, C, DDC, Final]
+  worker_unit: whole_scene_candidate_set
+  require_per_head_valid_mask: true
+  async: false
+stage1:
+  task: mode_conditioned_future_pretraining
+  entrypoint: scripts/run_stage1_multiview.py
+  future_target_source: generated_multiview_future_mp4
+  # The clean GT trajectory runs through the DiT at sigma=0 -- the same flow Stage 2
+  # noises, at its noise-free end -- and the future queries are read out of the last
+  # layer.  No anchors and no Hungarian assignment take part: the dataset already
+  # pairs register row k with GT row k.
+  action_input: clean_gt_trajectory_at_sigma_zero
+  model_inputs: [observations, gt_trajectories, zeroed_mode_codes]
+  assignment: identity_one_register_row_per_gt
+  loss: identity_future_l1
+  # The future queries live inside theta now, so Stage 1 trains the DiT trunk rather
+  # than freezing it.  Only the velocity head stays frozen: nothing in this loss
+  # reads it, and freezing it keeps its near-zero anchor-preserving initialization
+  # out of the optimizer entirely.
+  train: [student_lora, scene_queries, student_neck, ego_hist_encoding, frame_time_embedding, scene_blocks, action_dit_trunk, future_queries, future_head]
+  freeze: [dino_base, teacher, target_standardizer, velocity_head, scorer]
+  online_oracle: false
+  epochs_start: 50
+stage2:
+  task: paired_generation_and_online_scoring
+  model_inputs: [observations, deterministic_action_sources, immutable_mode_codes]
+  full_action_stack_traversals: 1
+  assignment: unique_hungarian_predicted_metric_xy_l1
+  same_assignment_for_action_and_future: false
+  loss_action: matched_residual_velocity_mse
+  loss_future: nearest_gt_dense_future_l1
+  loss_score: original_drivor_score_loss_all64
+  train: [student_lora, scene_queries, student_neck, ego_hist_encoding, frame_time_embedding, scene_blocks, action_branch, future_queries, future_head, scorer]
+  freeze: [dino_base, teacher, target_standardizer]
+  online_oracle: true
+  epochs_start: 50
+loss:
+  # These three weights are stated against an L1 whose reduction is an element-mean:
+  # the 1024 feature width first, then a quality x validity weighted mean over the
+  # register token axis.  That is what keeps them valid now that the token axis went
+  # from 8 to 32 -- measured, same per-element error at both widths, dense_future_l1
+  # 0.925637 vs 0.925637 and identity_future_l1 0.250000 vs 0.250000, ratio exactly
+  # 1.000000.  A sum over tokens instead of a mean would have multiplied the future
+  # term by 4 and silently re-weighted it against the velocity and score losses, which
+  # is the kind of change that shows up as "training got worse" and not as an error.
+  lambda_future_stage1: 1.0
+  lambda_action_stage2: 1.0
+  lambda_future_stage2: 0.1
+  lambda_score_stage2: 1.0
+  # Dense, not matched-only: a Hungarian assignment reaches K of the 64 candidates,
+  # so 60+ register rows would get zero future gradient even though Stage 1 trained
+  # them -- and those rows share the DiT trunk with the trajectory.
+  stage2_future_pairing: nearest_gt_dense_all_candidates
+  supervise_unmatched_future: true
+optimization:
+  new_module_lr: 0.0002
+  lora_lr: 0.00001
+  scorer_lr: 0.0005
+  weight_decay: 0.01
+  warmup_fraction: 0.1
+  grad_clip_norm: 1.0
+  optimizers_have_disjoint_parameters: true
+  complete_all_backward_before_step: true
+  use_bf16_if_supported: true
+  gradient_checkpointing: false
+  smoke_batch_size: 1
+  smoke_candidates: 8
+  production_candidates: 64
+  ddp_allow_unused_with_audit: true
+data:
+  # The real directory.  /mnt/data/multi_view/navtrain_full_allcosmos_cuda_v1_gpu64/
+  # navtrain_full_allcosmos_cuda_v1_gpu64 is a symlink to this one (same 103075
+  # scenes), so naming the target keeps `readlink -f` a no-op and makes the audit
+  # logs match what the loader actually opens.
+  multiview_root: /mnt/data/multi_future_view/navtrain_full_allcosmos_cuda_v1_gpu64/navtrain_full_allcosmos_cuda_v1_gpu64
+  multiview_future_container: mp4
+  multiview_future_frames: 41
+  multiview_future_fps: 10
+  multiview_future_indices: [5, 10, 15, 20, 25, 30, 35, 40]
+  multiview_video_hw: [464, 832]
+  multiview_trajectory_source: trajectory_k/ego_pose.npy
+  multiview_pose_frame: t0_local_rear_x_forward_y_left_yaw_ccw_metres_radians
+  multiview_degenerate_flag: duplicate_trajectory_label
+  multi_gt_format: scene_directory_or_legacy_npz
+  multi_gt_future_sampling: 0.5s
+  navsim_sensor_root: /mnt/data/navsim/trainval_sensor_blobs/trainval
+  navsim_log_root: /mnt/data/navsim/trainval_navsim_logs/trainval
+  navsim_log_rate_hz: 2
+  history_image_resolution: log_cams_data_path_by_camera_token
+  online_drivor_metric_cache: /mnt/zhaozc_workspace/project/DrivoR_multigt_kvcache_final_20261004/data_runtime/train_metric_cache
+  offline_fastwam_metric_cache: /mnt/zhaozc_workspace/project/FastWAM/data/metric_cache_navtrain
+  offline_cache_requires_trajectory_key: true

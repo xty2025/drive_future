@@ -1,0 +1,12 @@
+hydra:
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+
+defaults:
+  - training_full_defaults
+  - override /agent: drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1
+  - _self_
+
+experiment_name: training_drivoR_action_dit_dinov3_vitl_human_xl1_diverse8_l1_trainval_full
+full_training:
+  reference_experiment: A23

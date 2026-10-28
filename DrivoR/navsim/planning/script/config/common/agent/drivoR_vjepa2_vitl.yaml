@@ -1,0 +1,26 @@
+defaults:
+  - drivoR
+  - _self_
+
+config:
+  cam_f0: [3]
+  cam_l0: []
+  cam_l1: []
+  cam_l2: []
+  cam_r0: []
+  cam_r1: []
+  cam_r2: []
+  cam_b0: []
+  lidar_pc: []
+  num_scene_tokens: 0
+  full_history_status: false
+  image_size: [1152, 672]
+  image_backbone:
+    family: vjepa2
+    model_name: vjepa2_vit_large
+    model_weights: ${oc.env:DRIVOR_VJEPA2_VITL_WEIGHTS,weights/vjepa2/vitl/target_encoder.safetensors}
+    use_lora: true
+    lora_rank: 32
+    finetune: false
+    gradient_checkpointing: true
+    use_grid_mask: true

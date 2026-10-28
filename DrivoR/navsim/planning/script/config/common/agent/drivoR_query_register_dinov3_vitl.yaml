@@ -1,0 +1,67 @@
+defaults:
+  - drivoR
+  - _self_
+
+_target_: navsim.agents.drivoR_query_register.agent.DrivoRQueryRegisterAgent
+
+config:
+  ref_num: 4
+  scorer_ref_num: 4
+  proposal_num: 64
+  one_token_per_traj: true
+  full_history_status: false
+  long_trajectory_additional_poses: 0
+  visual_feature_mode: native_patches
+  num_scene_tokens: 0
+  cam_f0: [3]
+  cam_l0: []
+  cam_l1: []
+  cam_l2: []
+  cam_r0: []
+  cam_r1: []
+  cam_r2: []
+  cam_b0: []
+  lidar_pc: []
+  image_size: [1152, 672]
+  image_backbone:
+    family: dinov3
+    model_name: dinov3_vitl16
+    model_weights: ${oc.env:DRIVOR_DINOV3_VITL_WEIGHTS,weights/dinov3/vitl16/model.safetensors}
+    use_lora: true
+    lora_rank: 32
+    finetune: false
+    gradient_checkpointing: true
+    use_grid_mask: true
+  query_register:
+    attention_mode: action_to_register
+    future_query_init_std: 0.02
+    gradient_checkpointing: true
+  multi_gt:
+    enabled: true
+    root: ${oc.env:DRIVOR_MULTI_GT_ROOT,/cpfs29jb/data/zhaozc/project/drive_future/multi_traj_gt_data/navtrain_multigt_top4_dense_0p1s_f64_8gpu}
+    max_gt: 4
+    missing_policy: original
+    matching: nearest
+    weighting: equal
+  future_register:
+    stage: joint
+    frames_root: ${oc.env:DRIVOR_REGISTER_FRAMES_ROOT,${oc.env:NAVSIM_EXP_ROOT}/world4scorer_data/frames_cosmos}
+    image_size: [384, 384]
+    sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT}/sensor_blobs/trainval
+    missing_frames: ignore
+    loss_type: l1
+    loss_weight: 1.0
+    ema_decay: 0.999
+    teacher_batch_size: 4
+    init_checkpoint: null
+    scorer:
+      enabled: false
+      fusion: project
+
+loss:
+  _target_: navsim.agents.drivoR_query_register.losses.DrivoRQueryRegisterLoss
+  trajectory_weight: 1.0
+  final_score_weight: 1.0
+
+checkpoint_path: ''
+accumulate_grad_batches: ${trainer.params.accumulate_grad_batches}

@@ -1,0 +1,23 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl
+  - _self_
+
+_target_: navsim.agents.drivoR_action_dit_register.agent.DrivoRActionRegisterAgent
+
+config:
+  multi_gt:
+    input_gt_assignment: original
+  future_register:
+    stage: joint
+    frames_root: ${oc.env:DRIVOR_REGISTER_FRAMES_ROOT,${oc.env:NAVSIM_EXP_ROOT}/world4scorer_data/frames_cosmos}
+    image_size: [384, 384]
+    sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT}/sensor_blobs/trainval
+    missing_frames: ignore
+    loss_type: velocity
+    loss_weight: 1.0
+    ema_decay: 0.999
+    teacher_batch_size: 4
+    init_checkpoint: null
+    scorer:
+      enabled: false
+      fusion: project

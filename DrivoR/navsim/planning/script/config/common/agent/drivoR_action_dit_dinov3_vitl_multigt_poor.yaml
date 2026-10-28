@@ -1,0 +1,10 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl
+  - _self_
+
+config:
+  multi_gt:
+    # Up to 4 original valid GTs plus up to 4 valid poor GTs, all equally weighted.
+    max_gt: 8
+    additional_roots:
+      - ${oc.env:DRIVOR_POOR_GT_ROOT,/cpfs29jb/data/zhaozc/project/drive_future/multi_traj_gt_data/navtrain_poor4_multigt_dense_0p1s_f64_16gpu}

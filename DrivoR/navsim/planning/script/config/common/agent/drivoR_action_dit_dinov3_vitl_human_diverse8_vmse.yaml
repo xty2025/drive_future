@@ -1,0 +1,8 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_diverse8_l1
+  - _self_
+
+# Same human anchor, same 64 predictions/time, same additional GTs and weight.
+config:
+  pseudo_expert:
+    loss_type: velocity

@@ -1,0 +1,16 @@
+hydra:
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+
+defaults:
+  - training_full_defaults
+  - _self_
+
+# Preserve the direct README entry's single-node/automatic-device behavior.
+# The five named full_* presets and DLC launchers select their 8x8 topology.
+trainer:
+  params:
+    num_nodes: 1
+    devices: auto
+agent:
+  num_gpus: 1

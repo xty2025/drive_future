@@ -1,0 +1,7 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_register_scorer
+  - _self_
+
+config:
+  future_register:
+    stage: future_only

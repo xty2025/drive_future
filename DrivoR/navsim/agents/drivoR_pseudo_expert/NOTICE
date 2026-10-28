@@ -1,0 +1,8 @@
+CLOVER Stage-1 pseudo-expert selection and coverage objective are adapted from:
+https://github.com/WilliamXuanYu/CLOVER
+navsim/agents/clover/pseudo_expert_utils.py
+navsim/agents/clover/layers/losses/drivor_loss.py
+The reference is licensed under Apache License 2.0.
+
+Local adaptations: offline vectorized FPS, memory-mapped training targets,
+FP32 coverage arithmetic, and a loss wrapper around the existing DrivoR model.

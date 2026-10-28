@@ -1,0 +1,8 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_human_diverse8_l1_register
+  - _self_
+
+config:
+  future_register:
+    scorer:
+      enabled: true

@@ -1,0 +1,11 @@
+defaults:
+  - drivoR_action_dit_dinov3_vitl_register_scorer
+  - _self_
+
+# Same 64 paired Action/Register predictions and fused scorer. Supervise only
+# the original human trajectory and the corresponding real future frames.
+config:
+  long_trajectory_additional_poses: 0
+  multi_gt:
+    enabled: false
+    max_gt: 1
